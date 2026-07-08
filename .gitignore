@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Run output and live snapshots (regenerated, never source)
+output/
+*.npz
+
+# Per-machine settings (endpoint UUIDs, archive paths) — see .env.example
+.env

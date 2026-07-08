@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<!--
+  PAI GPU Power Monitor — live dashboard.
+
+  Single-page dashboard served by gpu_power_monitor/web/server.py. It polls
+  /api/latest (the rolling live window written by live_buffer.py) and /api/config
+  (static run info), and renders three instrument-style panels on a <canvas>.
+  No charting library — plain canvas keeps it fast and dependency-free.
+
+  States: LIVE (acquiring), STALE (writer stopped without an end state),
+  COMPLETE (run ended cleanly), REPLAY (playing back a recorded run),
+  ARCHIVED, IDLE (no data yet), ERROR (acquisition error),
+  DISCONNECTED (this page lost the server — display holds the last data).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PAI GPU Power Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  body[data-theme="dark"] {
+    --bg:#0e0f12; --panel:#15171c; --chrome:#181a20; --grid:#23262e; --gridmaj:#353a45; --tick:#5e6675;
+    --ink:#e9e6df; --muted:#949aa6; --overlay:rgba(20,22,28,.94); --line:#252932;
+    --volt:#e8b54a; --curr:#56b487; --pow:#e0584f; --warn:#ff5a4d;
+    --ok:#6fb073; --idle:#7c8493; --replay:#7e9cd8; --archived:#4bb39a; --err:#ff5a4d; --stale:#e8b54a;
+  }
+  body[data-theme="light"] {
+    --bg:#f2f1ee; --panel:#fbfaf7; --chrome:#ecebe6; --grid:#dedcd5; --gridmaj:#c2bfb6; --tick:#9a978e;
+    --ink:#23262b; --muted:#6b6f78; --overlay:rgba(255,255,255,.95); --line:#dedcd5;
+    --volt:#b8860b; --curr:#2f8f63; --pow:#c0392b; --warn:#c0392b;
+    --ok:#4e8a3c; --idle:#7c8493; --replay:#3f6bb0; --archived:#2f8a78; --err:#c0392b; --stale:#b8860b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 15px/1.4 "Outfit", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "tnum" 1;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header { display: flex; align-items: center; gap: 24px; padding: 12px 22px;
+           background: var(--chrome); border-bottom: 1px solid var(--line); }
+  .runTitle { font-size: 24px; font-weight: 700; line-height: 1; }
+  .runSub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .elapsedLbl { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .elapsed { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .spacer { flex: 1; }
+  .badge { font-weight: 700; font-size: 16px; letter-spacing: 1px; padding: 8px 18px;
+           border-radius: 999px; border: 1px solid transparent; display: inline-flex; align-items: center; gap: 9px; }
+  .badge .dot { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+  .badge.live { color: var(--ok); border-color: var(--ok); }
+  .badge.live .dot { animation: pulse 1.1s infinite; }
+  .badge.idle { color: var(--idle); border-color: var(--idle); }
+  .badge.stale { color: var(--stale); border-color: var(--stale); }
+  .badge.complete { color: var(--ok); border-color: var(--ok); }
+  .badge.replay { color: var(--replay); border-color: var(--replay); }
+  .badge.archived { color: var(--archived); border-color: var(--archived); }
+  .badge.error { color: var(--err); border-color: var(--err); }
+  .badge.disconnected { color: var(--idle); border-color: var(--idle); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .panels { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; min-height: 0; }
+  .panel { position: relative; flex: 1; background: var(--panel); border: 1px solid var(--line);
+           border-radius: 14px; min-height: 0; overflow: hidden; }
+  .panel canvas { display: block; width: 100%; height: 100%; }
+  .statBox { position: absolute; top: 8px; right: 12px; text-align: left;
+             background: var(--overlay); border: 1px solid var(--line);
+             padding: 7px 11px; border-radius: 10px; pointer-events: none; }
+  .statBox .name { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+  .statGrid { display: grid; grid-template-columns: auto auto auto; gap: 1px 8px;
+              font-size: 13px; font-variant-numeric: tabular-nums; }
+  .statGrid .k { color: var(--muted); text-align: left; }
+  .statGrid .val { text-align: right; color: var(--ink); font-weight: 650; }
+  .statGrid .u { color: var(--muted); text-align: left; }
+  .big { position: absolute; bottom: 12px; right: 18px; font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; pointer-events: none; }
+  .big.warn { color: var(--warn) !important; }
+  .rails { position: absolute; bottom: 12px; left: 62px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; pointer-events: none; }
+  .rails b { color: var(--ink); font-weight: 650; }
+  .panel.v .name, .panel.v .big { color: var(--volt); }
+  .panel.i .name, .panel.i .big { color: var(--curr); }
+  .panel.p .name, .panel.p .big { color: var(--pow); }
+  footer { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+           padding: 10px 16px; background: var(--chrome); border-top: 1px solid var(--line); }
+  button { background: transparent; color: var(--ink); border: 1px solid var(--line);
+           border-radius: 9px; padding: 8px 12px; font-size: 13px; cursor: pointer; font-family: inherit; }
+  button:hover { border-color: var(--tick); }
+  button.active { border-color: var(--volt); color: var(--volt); }
+  .group { display: flex; gap: 6px; align-items: center; }
+  .group .lbl { color: var(--muted); font-size: 12px; }
+  .summary { color: var(--muted); font-size: 13px; }
+  .summary b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  kbd { border:1px solid var(--line); border-radius:4px; padding:1px 6px; font-size:11px; }
+</style>
+</head>
+<body data-theme="dark">
+  <header>
+    <div>
+      <div class="runTitle" id="runTitle">—</div>
+      <div class="runSub" id="runSub"></div>
+    </div>
+    <div>
+      <div class="elapsed" id="elapsed">00:00:00</div>
+      <div class="elapsedLbl">Time Elapsed</div>
+    </div>
+    <span class="spacer"></span>
+    <span id="badge" class="badge idle"><span class="dot"></span><span id="badgeText">Idle</span></span>
+  </header>
+
+  <div class="panels">
+    <div class="panel v">
+      <canvas id="cv"></canvas>
+      <div class="statBox"><div class="name">Voltage</div><div class="statGrid" id="sv"></div></div>
+      <div class="big" id="bv">—</div>
+    </div>
+    <div class="panel i">
+      <canvas id="ci"></canvas>
+      <div class="statBox"><div class="name">Total Current</div><div class="statGrid" id="si"></div></div>
+      <div class="rails" id="rails"></div>
+      <div class="big" id="bi">—</div>
+    </div>
+    <div class="panel p">
+      <canvas id="cp"></canvas>
+      <div class="statBox"><div class="name">Power</div><div class="statGrid" id="sp"></div></div>
+      <div class="big" id="bp">—</div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="group">
+      <button id="btnPause">⏸ Pause Display</button>
+      <button id="btnReplay" style="display:none">▶ Replay run</button>
+      <button id="btnZoom">⛶ Zoom</button>
+      <button id="btnResetView">Reset View</button>
+      <button id="btnFull">Fullscreen</button>
+      <button id="btnTheme">☀ Light</button>
+    </div>
+    <div class="group" id="repCtl" style="display:none">
+      <span class="lbl">Speed</span>
+      <button id="spd1" class="active">1×</button>
+      <button id="spd10">10×</button>
+      <button id="spd60">60×</button>
+      <button id="spdFull">Full run</button>
+    </div>
+    <div class="group">
+      <span class="lbl">Window</span>
+      <button id="btnZoomOut">−</button>
+      <span class="summary"><b id="winLabel">5.0</b> s</span>
+      <button id="btnZoomIn">+</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="summary">
+      Window Avg <b id="winAvg">—</b> · Run Avg <b id="runAvg">—</b>
+      &nbsp;·&nbsp; Window Peak <b id="winPeak">—</b> · Run Peak <b id="runPeak">—</b>
+      &nbsp;·&nbsp; Energy <b id="energy">—</b>
+    </div>
+  </footer>
+
+<script>
+(() => {
+  "use strict";
+  // autoscale: derive the y-range from the visible data (Current, Power).
+  // Voltage stays on its fixed rail limits — it reads fine as-is.
+  const SERIES = {
+    v: { canvas: cv, stats: sv, big: bv, src: "voltage_v",        fixed: [11.5, 13.0],   unit: "V", dp: 2, hi: 13.0, lo: 11.5, autoscale: false },
+    i: { canvas: ci, stats: si, big: bi, src: "total_current_a",  fixed: [-1.0, 15.0],   unit: "A", dp: 2, hi: 15.0, lo: null, autoscale: true },
+    p: { canvas: cp, stats: sp, big: bp, src: "total_power_w",    fixed: [-10.0, 180.0], unit: "W", dp: 1, hi: 180.0, lo: null, autoscale: true },
+  };
+  const buf = { t: [], voltage_v: [], total_current_a: [], current1_a: [], current2_a: [], total_power_w: [] };
+  let cfg = { window_sec: 60, refresh_ms: 50, stale_after_sec: 2, y_limits: {}, replay: false };
+  let windowSec = 60.0, defaultWindowSec = 60.0, dispPaused = false, state = "IDLE", theme = "dark";
+  let dispRight = 0, elapsedVal = 0, runAvgVal = null, runPeakVal = null, energyJ = null;
+  let zoomMode = false, frozen = false, viewLeft = 0, viewRight = 0, replayMode = false;
+  let staleAgeSec = null;
+  // replay playback: a virtual clock sweeps playPos through the loaded history
+  // so a recorded run renders exactly like a live one.
+  let playing = false, playSpeed = 1, playPos = 0, playAtEnd = false, lastTick = null;
+  const yOverride = { v: null, i: null, p: null };
+  const geom = {}; let sel = null; let C = {};
+  // Only redraw when something actually changed — avoids the constant full-canvas
+  // repaint + DOM rewrite that caused the flicker.
+  let needsDraw = true;
+  const markDirty = () => { needsDraw = true; };
+  const domCache = {};  // last text written per element id, to skip no-op DOM writes
+  function setText(el, text) { if (domCache[el.id] !== text) { domCache[el.id] = text; el.textContent = text; } }
+  function setHTML(el, html) { if (domCache[el.id] !== html) { domCache[el.id] = html; el.innerHTML = html; } }
+
+  function refreshColors() {
+    const cs = getComputedStyle(document.body);
+    C = { v: cs.getPropertyValue("--volt").trim(), i: cs.getPropertyValue("--curr").trim(),
+          p: cs.getPropertyValue("--pow").trim(), grid: cs.getPropertyValue("--grid").trim(),
+          gridmaj: cs.getPropertyValue("--gridmaj").trim(), tick: cs.getPropertyValue("--tick").trim() };
+  }
+  const fmt = (x,d=2) => Number.isFinite(x) ? x.toFixed(d) : "—";
+  const histStart = () => buf.t.length ? buf.t[0] : 0;
+  const histEnd = () => buf.t.length ? buf.t[buf.t.length-1] : 0;
+  function curRange() {
+    if (frozen) return { left: viewLeft, right: viewRight };
+    const right = dispRight; return { left: Math.max(0, right-windowSec), right };
+  }
+
+  // Graticule steps snap to real units on a 1-2-5 ladder (…, 0.1, 0.2, 0.5,
+  // 1, 2, 5, …) so each minor box is a round quantity (e.g. 100 ms, 2 W) like
+  // scope/LTspice divisions. Returns the smallest such step at least
+  // targetPx apart on screen — so the grid refines as the window widens or
+  // the view zooms in.
+  function niceStep(span, px, targetPx) {
+    const raw = span * targetPx / Math.max(1, px);
+    if (!Number.isFinite(raw) || raw <= 0) return 1;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 5]) if (mag * m >= raw) return mag * m;
+    return mag * 10;
+  }
+
+  // Auto y-range: center the visible trace with padding and a sane minimum span.
+  function autoRange(fin, fallback) {
+    if (!fin.length) return fallback;
+    let mn = Math.min(...fin), mx = Math.max(...fin);
+    let span = mx - mn;
+    if (span < 1e-6) span = Math.max(Math.abs(mx) * 0.1, 1.0);  // flat signal
+    const pad = span * 0.15;
+    return [mn - pad, mx + pad];
+  }
+
+  function drawPanel(key) {
+    const s = SERIES[key], el = s.canvas, ctx = el.getContext("2d");
+    const dpr = window.devicePixelRatio || 1, W = el.clientWidth, H = el.clientHeight;
+    if (el.width !== W*dpr || el.height !== H*dpr) { el.width = W*dpr; el.height = H*dpr; }
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+
+    const { left, right } = curRange();
+    const T = buf.t, arr = buf[s.src];
+    let lo = 0; while (lo < T.length && T[lo] < left) lo++;
+    let hi = T.length; while (hi > lo && T[hi-1] > right) hi--;
+    const vis = arr.slice(lo, hi);
+    const fin = vis.filter(Number.isFinite);
+    let ymin, ymax;
+    if (yOverride[key]) { [ymin, ymax] = yOverride[key]; }       // manual zoom box
+    else if (s.autoscale) { [ymin, ymax] = autoRange(fin, s.fixed); }
+    else { [ymin, ymax] = s.fixed; }
+
+    const padL = 56, padR = 12, padT = 8, padB = (key==="p") ? 24 : 12;
+    const x0 = padL, x1 = W-padR, y0 = padT, y1 = H-padB;
+    geom[key] = { x0, x1, y0, y1, left, right, ymin, ymax };
+    const xOf = t => x0 + (x1-x0)*(t-left)/Math.max(1e-9,right-left);
+    const yOf = y => y1 - (y1-y0)*(y-ymin)/Math.max(1e-9,ymax-ymin);
+
+    // Scope-style graticule: minor gridlines at absolute multiples of a nice
+    // unit step (so each tiny box is e.g. exactly 1 s or 10 ms wide), brighter
+    // major lines every 5 minors, labels on the majors. The steps recompute
+    // every draw, so the grid adapts to the window width, zoom, and resizes.
+    ctx.fillStyle = C.tick; ctx.lineWidth = 1;
+    ctx.font = "11px Outfit, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    const minorY = niceStep(ymax-ymin, y1-y0, 12), majorY = minorY*5;
+    const decY = Math.max(0, -Math.floor(Math.log10(majorY)));
+    for (let k=Math.ceil(ymin/minorY - 1e-6); k*minorY <= ymax + minorY*1e-6; k++) {
+      const val = k*minorY, yy = yOf(val), isMaj = ((k%5)+5)%5 === 0;
+      ctx.strokeStyle = isMaj ? C.gridmaj : C.grid;
+      ctx.beginPath(); ctx.moveTo(x0,yy); ctx.lineTo(x1,yy); ctx.stroke();
+      if (isMaj && yy > y0+6 && yy < y1-6) ctx.fillText(val.toFixed(decY), 6, yy);
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const minorX = niceStep(right-left, x1-x0, 14), majorX = minorX*5;
+    // Label in ms once the major step drops below 0.1 s (deep zoom).
+    const [xScale, xUnit] = majorX < 0.1 ? [1000, "ms"] : [1, "s"];
+    const decX = Math.max(0, -Math.floor(Math.log10(majorX*xScale)));
+    for (let k=Math.ceil(left/minorX - 1e-6); k*minorX <= right + minorX*1e-6; k++) {
+      const tv = k*minorX, xx = xOf(tv), isMaj = ((k%5)+5)%5 === 0;
+      ctx.strokeStyle = isMaj ? C.gridmaj : C.grid;
+      ctx.beginPath(); ctx.moveTo(xx,y0); ctx.lineTo(xx,y1); ctx.stroke();
+      if (key==="p" && isMaj && xx > x0+10 && xx < x1-10)
+        ctx.fillText((tv*xScale).toFixed(decX)+" "+xUnit, xx, y1+5);
+    }
+
+    if (hi-lo > 1) {
+      ctx.beginPath();
+      for (let k=lo;k<hi;k++){ const xx=xOf(T[k]), yy=yOf(arr[k]); k===lo?ctx.moveTo(xx,yy):ctx.lineTo(xx,yy); }
+      ctx.strokeStyle = C[key]; ctx.lineWidth = 1.4; ctx.stroke();
+    }
+    if (state === "IDLE") { ctx.fillStyle = "rgba(128,128,128,.22)"; ctx.fillRect(0,0,W,H); }
+
+    if (sel && sel.key === key) {
+      ctx.fillStyle = "rgba(120,160,210,.18)"; ctx.strokeStyle = C.tick; ctx.lineWidth = 1;
+      const rx=Math.min(sel.ax,sel.bx), ry=Math.min(sel.ay,sel.by), rw=Math.abs(sel.bx-sel.ax), rh=Math.abs(sel.by-sel.ay);
+      ctx.fillRect(rx,ry,rw,rh); ctx.strokeRect(rx,ry,rw,rh);
+    }
+
+    if (fin.length) {
+      const mean = fin.reduce((a,b)=>a+b,0)/fin.length;
+      const std = Math.sqrt(fin.reduce((a,b)=>a+(b-mean)*(b-mean),0)/fin.length);
+      const peak = Math.max(...fin);
+      setHTML(s.stats, [["Avg",fmt(mean,s.dp)],["Std",fmt(std,s.dp)],["Peak",fmt(peak,s.dp)]]
+        .map(([k,val])=>`<span class="k">${k}</span><span class="val">${val}</span><span class="u">${s.unit}</span>`).join(""));
+      const cur = fin[fin.length-1];
+      setText(s.big, `${fmt(cur,s.dp)} ${s.unit}`);
+      s.big.classList.toggle("warn", (s.hi!=null&&cur>s.hi)||(s.lo!=null&&cur<s.lo));
+    }
+  }
+  function drawAll() { for (const k in SERIES) drawPanel(k); }
+
+  const hhmmss = sec => { sec=Math.max(0,sec||0); const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=Math.floor(sec%60);
+    return [h,m,s].map(n=>String(n).padStart(2,"0")).join(":"); };
+  const fmtAge = sec => sec < 90 ? `${Math.round(sec)} s`
+    : sec < 5400 ? `${Math.round(sec/60)} min` : `${(sec/3600).toFixed(1)} h`;
+
+  // Server states arrive UPPERCASE (they key the badge CSS class); the badge
+  // shows them in Title Case.
+  const STATE_LABEL = { LIVE: "Live", IDLE: "Idle", STALE: "Stale", COMPLETE: "Run Complete",
+    REPLAY: "Replay", ARCHIVED: "Archived", ERROR: "Error", DISCONNECTED: "Disconnected" };
+  function badgeLabel() {
+    if (state === "COMPLETE") return "Run Complete";
+    if (state === "DISCONNECTED") return "Disconnected · Display Paused";
+    if (state === "STALE") return staleAgeSec!=null ? `Stale · Last Data ${fmtAge(staleAgeSec)} Ago` : "Stale";
+    if (state === "REPLAY" && replayMode)
+      return playing ? `Replay ${playSpeed}×` : (playAtEnd ? "Replay · End" : "Replay · Paused");
+    if (state === "LIVE" && dispPaused) return "Live · Display Paused";
+    return STATE_LABEL[state] || state;
+  }
+
+  function updateChrome() {
+    setText(elapsed, hhmmss(replayMode && !frozen ? playPos : elapsedVal));
+    setText(winLabel, windowSec.toFixed(1));
+    if (buf.current1_a.length) { const a=buf.current1_a.at(-1), b=buf.current2_a.at(-1);
+      if (Number.isFinite(a) && Number.isFinite(b))
+        setHTML(rails, `I1 <b>${fmt(a,2)} A</b> · I2 <b>${fmt(b,2)} A</b> · Δ <b>${fmt(Math.abs(a-b),2)} A</b>`); }
+    const { left, right } = curRange();
+    let lo=0; while (lo<buf.t.length && buf.t[lo]<left) lo++;
+    let hi=buf.t.length; while (hi>lo && buf.t[hi-1]>right) hi--;
+    const winP = buf.total_power_w.slice(lo,hi).filter(Number.isFinite);
+    setText(winAvg, winP.length ? `${fmt(winP.reduce((a,b)=>a+b,0)/winP.length,1)} W` : "—");
+    setText(winPeak, winP.length ? `${fmt(Math.max(...winP),1)} W` : "—");
+    setText(runAvg, runAvgVal!=null ? `${fmt(runAvgVal,1)} W` : "—");
+    setText(runPeak, runPeakVal!=null ? `${fmt(runPeakVal,1)} W` : "—");
+    setText(energy, energyJ!=null ? `${fmt(energyJ/3600,2)} Wh` : "—");
+    const b = document.getElementById("badge"); b.className = "badge " + state.toLowerCase();
+    setText(badgeText, badgeLabel());
+    // Offer replay whenever a non-live run is on screen in poll mode.
+    const offer = !replayMode && buf.t.length > 0 && ["STALE","COMPLETE","ARCHIVED","REPLAY"].includes(state);
+    btnReplay.style.display = offer ? "" : "none";
+  }
+
+  // Single render loop. Repaints when needsDraw is set (poll, interaction,
+  // resize, theme) and continuously while replay playback advances.
+  function frame(now) {
+    if (replayMode && playing) {
+      if (lastTick != null) {
+        playPos = Math.min(histEnd(), playPos + ((now - lastTick) / 1000) * playSpeed);
+        dispRight = playPos;
+        if (playPos >= histEnd()) { playing = false; playAtEnd = true; updatePlayBtn(); }
+      }
+      lastTick = now; needsDraw = true;
+    }
+    if (needsDraw) { needsDraw = false; drawAll(); updateChrome(); }
+    requestAnimationFrame(frame);
+  }
+
+  async function poll() {
+    if (replayMode) return;   // playback took over; the run_id watcher still runs
+    try {
+      const d = await (await fetch("/api/latest", { cache: "no-store" })).json();
+      state = d.state || "IDLE";
+      staleAgeSec = (d.server_epoch && d.generated_at_epoch)
+        ? Math.max(0, d.server_epoch - d.generated_at_epoch) : null;
+      elapsedVal = d.elapsed_s ?? d.latest_sample_time_s ?? elapsedVal;
+      runAvgVal = d.run_avg_power_w ?? null; runPeakVal = d.run_peak_power_w ?? null; energyJ = d.energy_j ?? null;
+      if (!dispPaused && !frozen && Array.isArray(d.time_s) && d.time_s.length) {
+        buf.t = d.time_s;
+        buf.voltage_v = d.voltage_v || []; buf.total_current_a = d.total_current_a || [];
+        buf.current1_a = d.current1_a || []; buf.current2_a = d.current2_a || [];
+        buf.total_power_w = d.total_power_w || [];
+        dispRight = buf.t[buf.t.length-1];
+      }
+      markDirty();
+    } catch (e) {
+      // Server gone (run stopped / Ctrl+C): hold the last traces on screen.
+      state = "DISCONNECTED"; markDirty();
+    }
+    setTimeout(poll, cfg.refresh_ms || 50);
+  }
+
+  function updatePlayBtn() {
+    if (replayMode) {
+      btnPause.textContent = playing ? "⏸ Pause" : (playAtEnd ? "▶ Replay again" : "▶ Play");
+      btnPause.classList.toggle("active", !playing);
+    } else {
+      btnPause.textContent = dispPaused ? "▶ Resume Display" : "⏸ Pause Display";
+      btnPause.classList.toggle("active", dispPaused);
+    }
+    markDirty();
+  }
+
+  // Pause/Resume. Resuming must undo a committed zoom too (frozen + y-zoom),
+  // otherwise the display stays stuck until Reset View.
+  function setPaused(p) {
+    dispPaused = p;
+    if (!p) {
+      frozen = false; yOverride.v = yOverride.i = yOverride.p = null;
+      if (buf.t.length) dispRight = buf.t[buf.t.length-1];
+    }
+    updatePlayBtn();
+  }
+
+  function setPlaying(p) {
+    playing = p;
+    if (playing) {
+      frozen = false; yOverride.v = yOverride.i = yOverride.p = null;
+      if (playAtEnd || playPos >= histEnd()) playPos = histStart();
+      playAtEnd = false; lastTick = null;
+    }
+    updatePlayBtn();
+  }
+
+  function setSpeed(mult, btn) {
+    playSpeed = mult;
+    for (const b of [spd1, spd10, spd60, spdFull]) b.classList.toggle("active", b === btn);
+    markDirty();
+  }
+
+  function fullRunView() {
+    playing = false; playAtEnd = false;
+    yOverride.v = yOverride.i = yOverride.p = null;
+    frozen = true; viewLeft = histStart(); viewRight = histEnd();
+    setSpeed(playSpeed, spdFull); updatePlayBtn();
+  }
+
+  function applyTheme(){ document.body.dataset.theme=theme; btnTheme.textContent = theme==="dark"?"☀ Light":"🌙 Dark"; refreshColors(); markDirty(); }
+
+  // Reset View: back to the default state. Live → default window + autoscale +
+  // resume live. Replay → restart playback from the beginning at 1x.
+  function resetView() {
+    yOverride.v = yOverride.i = yOverride.p = null;
+    zoomMode = false; btnZoom.classList.remove("active"); document.body.style.cursor = "";
+    windowSec = defaultWindowSec;
+    if (replayMode) {
+      playPos = histStart(); setSpeed(1, spd1); setPlaying(true);
+    } else {
+      setPaused(false);
+    }
+    markDirty();
+  }
+
+  btnPause.onclick = () => { if (replayMode) setPlaying(!playing); else setPaused(!dispPaused); };
+  btnZoom.onclick = () => { if (!replayMode) setPaused(true); else setPlaying(false);
+    zoomMode=true; btnZoom.classList.add("active"); document.body.style.cursor="crosshair"; };
+  btnResetView.onclick = resetView;
+  btnZoomIn.onclick = () => { windowSec=Math.max(0.5,windowSec/2); markDirty(); };
+  btnZoomOut.onclick = () => { windowSec=Math.min(60,windowSec*2); markDirty(); };
+  btnFull.onclick = () => { document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen(); };
+  btnTheme.onclick = () => { theme = theme==="dark"?"light":"dark"; applyTheme(); };
+  btnReplay.onclick = () => { loadReplay(); };
+  spd1.onclick = () => setSpeed(1, spd1);
+  spd10.onclick = () => setSpeed(10, spd10);
+  spd60.onclick = () => setSpeed(60, spd60);
+  spdFull.onclick = fullRunView;
+
+  // Zoom drag: start on a canvas, but track move/up on window so a drag that
+  // ends outside the panel still commits the zoom.
+  function canvasPos(el, e) { const r = el.getBoundingClientRect(); return { x: e.clientX-r.left, y: e.clientY-r.top }; }
+  for (const k in SERIES) {
+    const el = SERIES[k].canvas;
+    el.addEventListener("mousedown", e => {
+      if (!zoomMode) return;
+      const p = canvasPos(el, e); sel = { key:k, ax:p.x, ay:p.y, bx:p.x, by:p.y }; markDirty();
+    });
+  }
+  window.addEventListener("mousemove", e => {
+    if (!sel) return; const p = canvasPos(SERIES[sel.key].canvas, e); sel.bx = p.x; sel.by = p.y; markDirty();
+  });
+  window.addEventListener("mouseup", () => {
+    if (!sel) return; const k = sel.key, g = geom[k];
+    const xa=Math.min(sel.ax,sel.bx),xb=Math.max(sel.ax,sel.bx),ya=Math.min(sel.ay,sel.by),yb=Math.max(sel.ay,sel.by);
+    if (g && xb-xa>6 && yb-ya>6) {
+      const tOf=px=>g.left+(g.right-g.left)*(px-g.x0)/(g.x1-g.x0);
+      const vOf=py=>g.ymin+(g.ymax-g.ymin)*(g.y1-py)/(g.y1-g.y0);
+      viewLeft=Math.max(0,tOf(xa)); viewRight=tOf(xb); frozen=true; yOverride[k]=[vOf(yb),vOf(ya)];
+      updatePlayBtn();   // pause button now reads "Resume"/"Play" — the way out of the zoom
+    }
+    sel=null; zoomMode=false; btnZoom.classList.remove("active"); document.body.style.cursor=""; markDirty();
+  });
+
+  window.addEventListener("keydown", e => {
+    if (e.key==="p") btnPause.onclick(); else if (e.key==="z") btnZoom.onclick();
+    else if (e.key==="r") btnResetView.onclick();
+    else if (e.key==="+"||e.key==="=") btnZoomIn.onclick(); else if (e.key==="-"||e.key==="_") btnZoomOut.onclick();
+    else if (e.key==="t") btnTheme.onclick();
+  });
+  window.addEventListener("resize", markDirty);
+
+  function subline(c) {
+    // Header subtitle: just when the run started.
+    if (c.started_at) { const d=new Date(c.started_at);
+      if (!isNaN(d)) return "Started " + d.toLocaleString([], {hour:"numeric",minute:"2-digit",month:"short",day:"numeric"}); }
+    return "";
+  }
+
+  // Replay: load the full recorded run once, then play it back like a live run.
+  async function loadReplay() {
+    replayMode = true; frozen = false; dispPaused = false;
+    repCtl.style.display = ""; btnReplay.style.display = "none";
+    try {
+      const s = await (await fetch("/api/latest", { cache: "no-store" })).json();
+      elapsedVal = s.elapsed_s ?? s.latest_sample_time_s ?? 0;
+      runAvgVal = s.run_avg_power_w ?? null; runPeakVal = s.run_peak_power_w ?? null; energyJ = s.energy_j ?? null;
+    } catch (e) {}
+    try {
+      const h = await (await fetch("/api/history", { cache: "no-store" })).json();
+      if (Array.isArray(h.time_s) && h.time_s.length) {
+        state = "REPLAY";
+        buf.t = h.time_s;
+        buf.voltage_v = h.voltage_v || []; buf.total_current_a = h.total_current_a || [];
+        buf.total_power_w = h.total_power_w || [];
+        buf.current1_a = []; buf.current2_a = [];   // not stored in history CSVs
+        setHTML(rails, "");
+        playPos = histStart(); dispRight = playPos;
+        setSpeed(1, spd1); setPlaying(true);
+      } else { state = "IDLE"; }
+    } catch (e) { state = "DISCONNECTED"; }
+    markDirty();
+  }
+
+  // If another run starts on this port, reload into it instead of leaving a
+  // stale tab behind (the server skips opening a duplicate tab when it sees
+  // this page already polling).
+  function watchRunId() {
+    setInterval(async () => {
+      try {
+        const c = await (await fetch("/api/config", { cache: "no-store" })).json();
+        if (cfg.run_id && c.run_id && c.run_id !== cfg.run_id) location.reload();
+      } catch (e) {}   // server between runs — poll() shows DISCONNECTED
+    }, 2000);
+  }
+
+  async function init() {
+    try { cfg = { ...cfg, ...(await (await fetch("/api/config")).json()) }; } catch (e) {}
+    windowSec = cfg.window_sec || 60; defaultWindowSec = windowSec;
+    const yl = cfg.y_limits || {};
+    if (yl.voltage) { SERIES.v.fixed = yl.voltage; SERIES.v.hi = yl.voltage[1]; SERIES.v.lo = yl.voltage[0]; }
+    if (yl.current) { SERIES.i.fixed = yl.current; SERIES.i.hi = yl.current[1]; }
+    if (yl.power)   { SERIES.p.fixed = yl.power;   SERIES.p.hi = yl.power[1]; }
+    runTitle.textContent = cfg.title || cfg.run_id || "Run";
+    runSub.textContent = subline(cfg);
+    applyTheme();
+    watchRunId();
+    if (cfg.replay) { await loadReplay(); } else { poll(); }
+    requestAnimationFrame(frame);
+  }
+  init();
+})();
+</script>
+</body>
+</html>

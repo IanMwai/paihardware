@@ -1,0 +1,62 @@
+sample_rate_hz: 10000
+chunk_size: 1000
+measurement_name: "GPU Power Measurement Test"
+
+channels:
+  device: "Dev1"
+  voltage: "ai0"
+  current1: "ai1"
+  current2: "ai2"
+  terminal: "RSE"
+  min_v: -0.5
+  max_v: 3.5
+
+scaling:
+  voltage_scale: 4.768
+  current_scale: 12.5
+
+processing:
+  voltage_delay_samples: 0
+  current_delay_samples: 0
+  power_average_samples: 10
+
+display:
+  window_sec: 60
+  refresh_ms: 30
+  stale_after_sec: 2
+  fullscreen: false
+  y_limits:
+    voltage: [11.5, 13.0]
+    current: [-1.0, 15.0]
+    power: [-10.0, 180.0]
+
+logging:
+  chunk_duration_sec: 60
+  file_prefix: "nidaq"
+  format: "csv"
+  queue_blocks: 200
+
+# Machine- and lab-specific storage values live in a `.env` file at the repo
+# root (copy `.env.example` and fill it in). Anything set there overrides the
+# values below, so this shared file needs no per-machine edits.
+storage:
+  # PAI_OUTPUT_ROOT in .env overrides.
+  output_root: "output"
+  # Archive destination on the cluster. This default is the Le Xie lab path;
+  # other labs set PAI_ARCHIVE_ROOT in .env instead of editing this file.
+  archive_root: "/n/holylabs/lexie_lab/Lab/gpu_power_logs"
+  retention_days: 14
+  globus:
+    # UUID of this machine's Globus Connect Personal endpoint. Per machine —
+    # set PAI_GLOBUS_LOCAL_ENDPOINT_ID in .env (GCP tray icon -> Web:
+    # Collection Details). Left empty here on purpose; archiving is disabled
+    # with a clear message until it is set.
+    local_endpoint_id: ""
+    # UUID of the destination collection. This default is the
+    # "Harvard FAS RC Holyoke" mapped collection (serves /n/holylabs);
+    # PAI_GLOBUS_REMOTE_ENDPOINT_ID in .env overrides.
+    remote_endpoint_id: "1156ed9e-6984-11ea-af52-0201714f6eab"
+    # Submit a Globus transfer automatically when a run completes cleanly.
+    auto_push: true
+    # Give up on a queued transfer after this many days (Globus retries until then).
+    deadline_days: 7

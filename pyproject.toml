@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pai-hardware"
+version = "0.1.0"
+description = "GPU power measurement acquisition, dashboard, and archive workflow (PAI hardware)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+# Real NI-DAQ hardware acquisition (not needed for --simulate).
+hardware = ["nidaqmx"]
+# Globus CLI for archive pushes to the cluster.
+archive = ["globus-cli"]
+dev = ["pytest"]
+
+[project.scripts]
+# `pai` resolves here after `pip install -e .`, so it works from any directory
+# in PowerShell without long paths. Subcommands: hardware / dashboard / archive.
+pai = "gpu_power_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gpu_power_monitor*"]
