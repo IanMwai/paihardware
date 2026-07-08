@@ -384,8 +384,8 @@ pai archive cleanup output/<run_id> --delete
 
 ## Hardware settings reference
 
-These match the lab's DAQ wiring (originally from the single-file NI script
-kept in `legacy/` as a reference) and live in `configs/default.yaml`.
+These match the lab's DAQ wiring (originally from `NI_script_VIP_1GPU_*.py`,
+kept in the repo as a legacy reference) and live in `configs/default.yaml`.
 No need to change them unless the wiring changes:
 
 - Channels: `Dev1/ai0` (voltage), `Dev1/ai1` + `Dev1/ai2` (current), `RSE`, −0.5…3.5 V
@@ -444,8 +444,7 @@ because they are not tracked by git.
 4. Push to your fork and open a pull request against `IanMwai/paihardware`.
    Keep your fork in sync with `git fetch upstream && git merge upstream/main`.
 
-Ground rules:
-
+## Ground rules
 - **Never commit `.env`** (it is gitignored) or any endpoint UUIDs, usernames,
   or lab-specific paths in code. Those belong in `.env` / `.env.example`.
 - Run `python -m pytest tests` before opening a PR (`pip install -e .[dev]`
