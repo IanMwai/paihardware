@@ -64,7 +64,7 @@
   .panels { flex: 1; display: flex; flex-direction: column; gap: 8px; padding: 12px 16px; min-height: 0; }
   .panel { position: relative; flex: 1; background: var(--panel); border: 1px solid var(--line);
            border-radius: 14px; min-height: 0; overflow: hidden; }
-  .panel canvas { display: block; width: 100%; height: 100%; }
+  .panel canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
   .statBox { position: absolute; top: 8px; right: 12px; text-align: left;
              background: var(--overlay); border: 1px solid var(--line);
              padding: 7px 11px; border-radius: 10px; pointer-events: none; }
@@ -178,6 +178,11 @@
   let playing = false, playSpeed = 1, playPos = 0, playAtEnd = false, lastTick = null;
   const yOverride = { v: null, i: null, p: null };
   const geom = {}; let sel = null; let C = {};
+  // Hover cursor: pixel position on the hovered canvas. Converted to a time
+  // each frame, so on a live trace the data scrolls past a fixed cursor while
+  // the readout tracks; on a frozen/zoomed/replay view it acts as a static
+  // measurement cursor. Mirrored across all three panels (same time axis).
+  let hover = null;
   // Only redraw when something actually changed — avoids the constant full-canvas
   // repaint + DOM rewrite that caused the flicker.
   let needsDraw = true;
@@ -190,7 +195,8 @@
     const cs = getComputedStyle(document.body);
     C = { v: cs.getPropertyValue("--volt").trim(), i: cs.getPropertyValue("--curr").trim(),
           p: cs.getPropertyValue("--pow").trim(), grid: cs.getPropertyValue("--grid").trim(),
-          gridmaj: cs.getPropertyValue("--gridmaj").trim(), tick: cs.getPropertyValue("--tick").trim() };
+          gridmaj: cs.getPropertyValue("--gridmaj").trim(), tick: cs.getPropertyValue("--tick").trim(),
+          overlay: cs.getPropertyValue("--overlay").trim(), ink: cs.getPropertyValue("--ink").trim() };
   }
   const fmt = (x,d=2) => Number.isFinite(x) ? x.toFixed(d) : "—";
   const histStart = () => buf.t.length ? buf.t[0] : 0;
@@ -286,6 +292,36 @@
       ctx.fillRect(rx,ry,rw,rh); ctx.strokeRect(rx,ry,rw,rh);
     }
 
+    // Hover cursor: a time cursor mirrored on every panel (all share the time
+    // axis), a dot snapped to the nearest sample with a value chip, and the
+    // time readout on the hovered panel. Hidden while a zoom box is dragged.
+    if (hover && !sel && hi - lo > 0) {
+      const hg = geom[hover.key];
+      if (hg && hover.x >= hg.x0 && hover.x <= hg.x1) {
+        const tCur = hg.left + (hg.right-hg.left)*(hover.x-hg.x0)/Math.max(1e-9, hg.x1-hg.x0);
+        if (tCur >= left && tCur <= right) {
+          const xx = xOf(tCur);
+          ctx.save();
+          ctx.strokeStyle = C.tick; ctx.lineWidth = 1; ctx.setLineDash([4,3]);
+          ctx.beginPath(); ctx.moveTo(xx,y0); ctx.lineTo(xx,y1); ctx.stroke();
+          ctx.restore();
+          const idx = nearestIdx(T, tCur, lo, hi);
+          const val = arr[idx];
+          if (Number.isFinite(val)) {
+            const dx = xOf(T[idx]), dy = Math.max(y0, Math.min(y1, yOf(val)));
+            ctx.fillStyle = C[key];
+            ctx.beginPath(); ctx.arc(dx, dy, 3, 0, Math.PI*2); ctx.fill();
+            cursorChip(ctx, `${fmt(val,s.dp)} ${s.unit}`, dx, dy, x0, x1, y0, y1);
+          }
+          if (hover.key === key) {
+            // ms once the view is deeply zoomed, matching the axis labels.
+            const tLabel = (right-left) < 0.5 ? `t = ${(tCur*1000).toFixed(2)} ms` : `t = ${tCur.toFixed(3)} s`;
+            cursorChip(ctx, tLabel, xx, y1-12, x0, x1, y0, y1);
+          }
+        }
+      }
+    }
+
     if (fin.length) {
       const mean = fin.reduce((a,b)=>a+b,0)/fin.length;
       const std = Math.sqrt(fin.reduce((a,b)=>a+(b-mean)*(b-mean),0)/fin.length);
@@ -298,6 +334,26 @@
     }
   }
   function drawAll() { for (const k in SERIES) drawPanel(k); }
+
+  // Index of the sample nearest to time t within T[lo:hi] (T is sorted).
+  function nearestIdx(T, t, lo, hi) {
+    let a = lo, b = hi - 1;
+    while (b - a > 1) { const m = (a + b) >> 1; if (T[m] < t) a = m; else b = m; }
+    return (t - T[a] <= T[b] - t) ? a : b;
+  }
+
+  // Small readout label with an overlay background, kept inside the plot area
+  // (flips to the left of the anchor near the right edge).
+  function cursorChip(ctx, text, x, y, x0, x1, y0, y1) {
+    ctx.font = "12px Outfit, sans-serif";
+    const w = ctx.measureText(text).width + 12, h = 18;
+    const cx = (x + 8 + w > x1 - 2) ? x - 8 - w : x + 8;
+    const cy = Math.max(y0 + 2, Math.min(y1 - h - 2, y - h/2));
+    ctx.fillStyle = C.overlay; ctx.strokeStyle = C.tick; ctx.lineWidth = 1;
+    ctx.fillRect(cx, cy, w, h); ctx.strokeRect(cx, cy, w, h);
+    ctx.fillStyle = C.ink; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(text, cx + 6, cy + h/2 + 0.5);
+  }
 
   const hhmmss = sec => { sec=Math.max(0,sec||0); const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=Math.floor(sec%60);
     return [h,m,s].map(n=>String(n).padStart(2,"0")).join(":"); };
@@ -463,6 +519,10 @@
       if (!zoomMode) return;
       const p = canvasPos(el, e); sel = { key:k, ax:p.x, ay:p.y, bx:p.x, by:p.y }; markDirty();
     });
+    el.addEventListener("mousemove", e => {
+      const p = canvasPos(el, e); hover = { key:k, x:p.x, y:p.y }; markDirty();
+    });
+    el.addEventListener("mouseleave", () => { hover = null; markDirty(); });
   }
   window.addEventListener("mousemove", e => {
     if (!sel) return; const p = canvasPos(SERIES[sel.key].canvas, e); sel.bx = p.x; sel.by = p.y; markDirty();
