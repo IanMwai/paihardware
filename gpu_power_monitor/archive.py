@@ -10,12 +10,69 @@ from .manifest import load_manifest, save_manifest, sha256_file
 from .utils import utc_now_iso
 
 
+# archive_status values that mean the run's data is on (or on its way to)
+# the cluster, so the local copy is no longer the only one.
+_ON_CLUSTER = {"transfer_pending", "archived_verified", "cleanup_eligible"}
+
+
+def run_kind(data: dict[str, Any]) -> str:
+    """A run's kind; manifests from before the field existed are archive runs."""
+    return data.get("run_kind", "archive")
+
+
+def set_run_kind(run_dir: Path, kind: str) -> dict[str, Any]:
+    """Reclassify a run as a test run (local scratch) or an archive run.
+
+    Promoting a completed test run re-arms archiving. Demotion is refused once
+    the run is on (or on its way to) the cluster: the archive is append-only,
+    so the local copy must keep its archived bookkeeping.
+    """
+    if kind not in ("archive", "test"):
+        raise ValueError(f"Unknown run kind: {kind!r} (expected 'archive' or 'test')")
+    run_dir = Path(run_dir)
+    data = load_manifest(run_dir)
+    if run_kind(data) == kind:
+        return data
+    if kind == "test" and data.get("archive_status") in _ON_CLUSTER:
+        raise RuntimeError(
+            f"'{run_dir.name}' is already on (or on its way to) the cluster archive - "
+            "it cannot become a test run"
+        )
+    data["run_kind"] = kind
+    if kind == "test":
+        data["archive_status"] = "local_only"
+    elif data.get("status") == "completed":
+        data["archive_status"] = "ready_to_archive"
+    save_manifest(run_dir, data)
+    return data
+
+
+def delete_test_run(run_dir: Path) -> None:
+    """Delete a local test run outright. Refuses anything archive-bound."""
+    run_dir = Path(run_dir)
+    data = load_manifest(run_dir)
+    if run_kind(data) != "test":
+        raise RuntimeError(
+            f"'{run_dir.name}' is not a test run - archive-bound runs are only deleted by "
+            '`pai archive cleanup` after they are archived (or demote it first: pai runs demote "<run>")'
+        )
+    if data.get("status") == "running":
+        raise RuntimeError(f"'{run_dir.name}' is still in progress - stop it before deleting")
+    shutil.rmtree(run_dir)
+
+
 def archive_destination(run_dir: Path, archive_root: Path) -> Path:
     return Path(archive_root) / Path(run_dir).name
 
 
 def copy_run(run_dir: Path, archive_root: Path) -> Path:
     run_dir = Path(run_dir)
+    data = load_manifest(run_dir)
+    if run_kind(data) == "test":
+        raise RuntimeError(
+            f"'{run_dir.name}' is a test run (local only) - promote it first: "
+            f'pai runs promote "{run_dir.name}"'
+        )
     # On Windows a POSIX cluster path like /n/holylabs/... resolves
     # drive-relative (C:\n\holylabs\...), so an unguarded copytree would
     # silently "archive" to the local disk and mark the run verified. A real
@@ -31,7 +88,6 @@ def copy_run(run_dir: Path, archive_root: Path) -> Path:
         raise FileExistsError(f"Archive destination already exists: {dest}")
     shutil.copytree(run_dir, dest, ignore=shutil.ignore_patterns("latest.npz", "latest_status.json"))
     verify_archive(run_dir, dest)
-    data = load_manifest(run_dir)
     data["archive_status"] = "archived_verified"
     data["archive"] = {
         "destination": str(dest),
@@ -101,6 +157,7 @@ def archive_status(run_dir: Path) -> dict[str, Any]:
     return {
         "run_id": data.get("run_id"),
         "status": data.get("status"),
+        "run_kind": run_kind(data),
         "archive_status": data.get("archive_status", "local_only"),
         "archive": data.get("archive", {}),
         "stats": data.get("stats", {}),

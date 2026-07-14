@@ -62,6 +62,19 @@ def test_push_sets_transfer_pending(tmp_path, globus_cli):
     assert "--recursive" in transfer_args and "checksum" in transfer_args
 
 
+def test_push_refuses_test_run(tmp_path, globus_cli):
+    run = tmp_path / "run"
+    run.mkdir()
+    create_manifest(run, AcquisitionConfig(measurement_name="test", test_run=True))
+    (run / "data.csv").write_text(
+        "time_s,voltage_v,current1_a,current2_a,total_power_w\n0,1,2,3,5\n", encoding="utf-8"
+    )
+    finalize_manifest(run, 1.0)
+    with pytest.raises(RuntimeError, match="test run"):
+        push_run(run, GLOBUS_CFG, ARCHIVE_ROOT)
+    assert load_manifest(run)["archive_status"] == "local_only"
+
+
 def test_push_refuses_uncompleted_run(tmp_path, globus_cli):
     run = tmp_path / "run"
     run.mkdir()

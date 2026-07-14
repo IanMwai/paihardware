@@ -21,6 +21,10 @@ class RunManifest:
     measurement_name: str
     run_id: str
     status: str = "running"
+    # "archive" runs are destined for the cluster archive; "test" runs are
+    # local scratch (never pushed, deletable at will). Manifests from before
+    # this field existed count as "archive".
+    run_kind: str = "archive"
     archive_status: str = "local_only"
     created_at: str = field(default_factory=utc_now_iso)
     started_at: str | None = None
@@ -40,6 +44,7 @@ def create_manifest(run_dir: Path, config: AcquisitionConfig) -> RunManifest:
     manifest = RunManifest(
         measurement_name=config.measurement_name,
         run_id=Path(run_dir).name,
+        run_kind="test" if config.test_run else "archive",
         started_at=utc_now_iso(),
         sample_rate_hz=float(config.sample_rate_hz),
         channels=asdict(config.channels),
@@ -74,7 +79,8 @@ def finalize_manifest(run_dir: Path, end_time_s: float) -> dict[str, Any]:
     data.update(
         {
             "status": "completed",
-            "archive_status": "ready_to_archive",
+            # Test runs stay local: completing one must not arm archiving.
+            "archive_status": "local_only" if data.get("run_kind") == "test" else "ready_to_archive",
             "ended_at": utc_now_iso(),
             "duration_s": float(end_time_s),
             "files": files,

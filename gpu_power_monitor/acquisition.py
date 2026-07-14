@@ -20,7 +20,7 @@ from .live_buffer import LiveBuffer
 from .logging_writer import ChunkWriter
 from .manifest import create_manifest, finalize_manifest, update_manifest
 from .processing import PowerProcessor
-from .utils import unique_run_dir
+from .utils import runs_root, unique_run_dir
 
 
 def with_measurement_name(config: AcquisitionConfig, name: str | None) -> AcquisitionConfig:
@@ -40,7 +40,9 @@ def acquire(
     print_fn: Callable[[str], None] = print,
 ) -> Path:
     if run_dir is None:
-        run_dir = unique_run_dir(config.storage.output_root, config.measurement_name)
+        run_dir = unique_run_dir(
+            runs_root(config.storage.output_root, test=config.test_run), config.measurement_name
+        )
     run_dir = Path(run_dir)
     create_manifest(run_dir, config)
     print_fn(f"[INFO] Run directory: {run_dir}")

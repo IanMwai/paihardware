@@ -4,9 +4,10 @@ Two layers over the same underlying workflows:
 
 * Direct subcommands for the **developer** persona (scriptable, no prompts)::
 
-      pai hardware [--simulate]      # start acquisition (headless by default)
-      pai dashboard <run> [--replay] # open a dashboard on a run
+      pai hardware [--simulate] [--test]  # start acquisition (headless by default)
+      pai dashboard <run> [--replay]      # open a dashboard on a run
       pai archive push|copy|verify|status|cleanup|mark-archived <run>
+      pai runs list|promote|demote|delete [run]  # test runs vs archive-bound runs
 
 * An interactive **menu** for the lab-demo persona, shown when `pai` is run with
   no arguments. It favors fast uptime and quick live/replay viewing.
@@ -19,10 +20,15 @@ import re
 import sys
 from pathlib import Path
 
-# Auto-generated run names look like "GPU Run 0", "GPU Run 1", ... The run
-# folder appends a _<timestamp>, e.g. "GPU Run 0_20260624_132551".
+# Auto-generated run names look like "GPU Run 0", "GPU Run 1", ... (test runs
+# count their own "Test Run N" sequence). The run folder appends a
+# _<timestamp>, e.g. "GPU Run 0_20260624_132551".
 _AUTO_NAME_PREFIX = "GPU Run"
-_AUTO_NAME_RE = re.compile(rf"^{re.escape(_AUTO_NAME_PREFIX)} (\d+)(?:_\d{{8}}_\d{{6}})?(?:_\d+)?$")
+_TEST_NAME_PREFIX = "Test Run"
+
+
+def _auto_name_re(prefix: str) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(prefix)} (\d+)(?:_\d{{8}}_\d{{6}})?(?:_\d+)?$")
 
 
 def _repo_root() -> Path:
@@ -39,11 +45,16 @@ def _output_root() -> Path:
 
 
 def _list_runs() -> list[Path]:
-    """Run directories under output/, newest first."""
+    """Run directories under output/ (archive-bound) and output/test/, newest first."""
+    from gpu_power_monitor.utils import TEST_RUNS_SUBDIR
+
     root = _output_root()
     if not root.exists():
         return []
-    runs = [p for p in root.iterdir() if p.is_dir()]
+    runs = [p for p in root.iterdir() if p.is_dir() and p.name != TEST_RUNS_SUBDIR]
+    test_root = root / TEST_RUNS_SUBDIR
+    if test_root.is_dir():
+        runs += [p for p in test_root.iterdir() if p.is_dir()]
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -56,23 +67,30 @@ def _resolve_run(run: str | Path) -> Path:
     """Resolve a run reference to a directory, accepting a bare run name.
 
     A user-typed name like ``GPU Run 0_20260624_132551`` is resolved against
-    ``output/`` so replay works regardless of the current directory.
+    ``output/`` (and ``output/test/``) so replay works regardless of the
+    current directory.
     """
+    from gpu_power_monitor.utils import TEST_RUNS_SUBDIR
+
     path = Path(run)
     if path.is_dir():
         return path
-    candidate = _output_root() / path.name
-    return candidate if candidate.is_dir() else path
+    for candidate in (_output_root() / path.name, _output_root() / TEST_RUNS_SUBDIR / path.name):
+        if candidate.is_dir():
+            return candidate
+    return path
 
 
-def auto_run_name() -> str:
-    """Next ``GPU Run N`` name, counting up from existing runs (0 if none)."""
+def auto_run_name(*, test: bool = False) -> str:
+    """Next ``GPU Run N`` (or ``Test Run N``) name, counting up from existing runs."""
+    prefix = _TEST_NAME_PREFIX if test else _AUTO_NAME_PREFIX
+    pattern = _auto_name_re(prefix)
     highest = -1
     for run in _list_runs():
-        match = _AUTO_NAME_RE.match(run.name)
+        match = pattern.match(run.name)
         if match:
             highest = max(highest, int(match.group(1)))
-    return f"{_AUTO_NAME_PREFIX} {highest + 1}"
+    return f"{prefix} {highest + 1}"
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +135,7 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
     )
     from gpu_power_monitor.config import load_config
 
+    run_dir = _resolve_run(run_dir)
     config = load_config(kwargs.get("config_path") or _default_config())
     archive_root = Path(kwargs.get("archive_root") or config.storage.archive_root)
     if command == "copy":
@@ -127,7 +146,7 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
 
         try:
             task_id = push_run(run_dir, config.storage.globus, archive_root)
-        except GlobusUnavailable as exc:
+        except (GlobusUnavailable, RuntimeError) as exc:
             print(f"[ERROR] {exc}")
             return 1
         print(f"[INFO] Transfer submitted (Globus task {task_id}).")
@@ -170,6 +189,88 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
     return 0
 
 
+def _relocate_run(run_dir: Path, *, test: bool) -> Path:
+    """Move a run folder to match its kind (output/ vs output/test/).
+
+    The manifest's ``run_kind`` is the source of truth; this move is only the
+    browsable convenience, so every failure degrades to a warning and the run
+    stays where it is (listings find it either way). Returns the current path.
+    """
+    import shutil
+
+    from gpu_power_monitor.live_buffer import read_live_status
+    from gpu_power_monitor.utils import runs_root
+
+    dest_parent = runs_root(_output_root(), test=test)
+    if run_dir.parent.resolve() == dest_parent.resolve():
+        return run_dir
+    if read_live_status(run_dir, stale_after_sec=5.0).state == "LIVE":
+        print("[WARN] Run appears to be in use (acquisition/dashboard) - leaving the folder "
+              "where it is; it is still listed correctly.")
+        return run_dir
+    dest = dest_parent / run_dir.name
+    if dest.exists():
+        print(f"[WARN] Not moving the folder, destination already exists: {dest}")
+        return run_dir
+    dest_parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(run_dir), str(dest))
+    except OSError as exc:
+        print(f"[WARN] Could not move the run folder ({exc}) - the run is still marked "
+              f"correctly and stays at: {run_dir}")
+        return run_dir
+    print(f"[INFO] Moved to: {dest}")
+    return dest
+
+
+def run_runs(action: str, run: str | None) -> int:
+    """`pai runs` - list local runs, or manage the test-vs-archive split."""
+    from gpu_power_monitor.archive import delete_test_run, run_kind, set_run_kind
+    from gpu_power_monitor.manifest import load_manifest
+    from gpu_power_monitor.utils import runs_root
+
+    if action == "list":
+        runs = _list_runs()
+        if not runs:
+            print("[INFO] No runs found under output/.")
+            return 0
+        for r in runs:
+            note = ""
+            try:
+                is_test = run_kind(load_manifest(r)) == "test"
+            except (FileNotFoundError, ValueError, OSError):
+                is_test = None
+            if is_test is not None and r.parent.resolve() != runs_root(_output_root(), test=is_test).resolve():
+                fix = "demote" if is_test else "promote"
+                note = f'   <- folder mismatch, fix with: pai runs {fix} "{r.name}"'
+            print(f"  {r.name}   [{_archive_label(r)}]{note}")
+        return 0
+    if not run:
+        print(f"[ERROR] 'pai runs {action}' needs a run name.")
+        return 1
+    run_dir = _resolve_run(run)
+    if not run_dir.is_dir():
+        print(f"[ERROR] No such run: {run}")
+        return 1
+    try:
+        if action == "promote":
+            set_run_kind(run_dir, "archive")
+            run_dir = _relocate_run(run_dir, test=False)
+            print(f"[INFO] '{run_dir.name}' is now archive-bound.")
+            print(f'[INFO] Push it with: pai archive push "{run_dir.name}"  (or menu option 5)')
+        elif action == "demote":
+            set_run_kind(run_dir, "test")
+            run_dir = _relocate_run(run_dir, test=True)
+            print(f"[INFO] '{run_dir.name}' is now a test run - it stays local and is never archived.")
+        elif action == "delete":
+            delete_test_run(run_dir)
+            print(f"[INFO] Deleted test run: {run_dir.name}")
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+    return 0
+
+
 def run_devices() -> int:
     """List connected NI-DAQ devices so the user can confirm the device name."""
     try:
@@ -206,17 +307,23 @@ def run_hardware(
     simulate: bool,
     display: bool,
     name: str | None = None,
+    test: bool = False,
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
 ) -> int:
+    import dataclasses
     import threading
 
     from gpu_power_monitor.acquisition import acquire, with_measurement_name
     from gpu_power_monitor.config import load_config
-    from gpu_power_monitor.utils import unique_run_dir
+    from gpu_power_monitor.utils import runs_root, unique_run_dir
 
-    config = with_measurement_name(load_config(config_path or _default_config()), name or auto_run_name())
+    config = with_measurement_name(
+        load_config(config_path or _default_config()), name or auto_run_name(test=test)
+    )
+    if test:
+        config = dataclasses.replace(config, test_run=True)
 
     if not display:
         # Headless (developer): acquisition in the foreground, Ctrl+C to stop.
@@ -227,7 +334,7 @@ def run_hardware(
     # Demo: acquisition in a background thread, dashboard in the foreground.
     from gpu_power_monitor.web import serve
 
-    run_dir = unique_run_dir(config.storage.output_root, config.measurement_name)
+    run_dir = unique_run_dir(runs_root(config.storage.output_root, test=test), config.measurement_name)
     stop = threading.Event()
 
     def _background_acquire() -> None:
@@ -262,12 +369,16 @@ def _auto_push(run_dir: Path, config) -> None:
     from gpu_power_monitor.manifest import load_manifest
 
     gcfg = config.storage.globus
-    if not gcfg.auto_push:
-        return
     try:
-        if load_manifest(run_dir).get("status") != "completed":
-            return  # errored or still-open runs are not archived
+        data = load_manifest(run_dir)
     except (FileNotFoundError, ValueError):
+        return
+    if data.get("status") != "completed":
+        return  # errored or still-open runs are not archived
+    if data.get("run_kind", "archive") == "test":
+        print(f'[INFO] Test run - kept local, not archived. Delete anytime with: pai runs delete "{run_dir.name}"')
+        return
+    if not gcfg.auto_push:
         return
     retry_hint = f'pai archive push "{run_dir}"  (or menu option 5)'
     reason = globus_push.globus_unready_reason(gcfg)
@@ -308,10 +419,13 @@ def _archive_label(run: Path) -> str:
         data = load_manifest(run)
     except (FileNotFoundError, ValueError, OSError):
         return "no manifest"
+    is_test = data.get("run_kind", "archive") == "test"
     if data.get("status") == "running":
-        return "run in progress"
+        return "test run in progress" if is_test else "run in progress"
     if data.get("status") == "error":
         return "run errored"
+    if is_test:
+        return "test run (local only)"
     status = data.get("archive_status", "local_only")
     return _ARCHIVE_LABELS.get(status, status)
 
@@ -389,6 +503,10 @@ def _menu_archive() -> int:
     if data.get("status") == "running":
         print("[INFO] This run is still in progress - it archives after it completes.")
         return 0
+    if data.get("run_kind", "archive") == "test":
+        print("[INFO] This is a test run - it stays local and is never archived.")
+        print("[INFO] To archive it after all, promote it first (menu option 6).")
+        return 0
     if status == "transfer_pending":
         print("[INFO] A Globus transfer is pending - checking...")
         try:
@@ -432,6 +550,54 @@ def _menu_archive() -> int:
     return 0
 
 
+def _menu_test_runs() -> int:
+    """Menu option 6: promote or delete test runs; mark un-archived runs as test."""
+    from gpu_power_monitor.archive import delete_test_run, run_kind, set_run_kind
+    from gpu_power_monitor.manifest import load_manifest
+
+    run = _choose_run("Runs (newest first):", annotate=_archive_label)
+    if run is None:
+        return 1
+    try:
+        data = load_manifest(run)
+    except (FileNotFoundError, ValueError, OSError):
+        print("[WARN] This run has no readable manifest - manage it by hand.")
+        return 1
+    if data.get("status") == "running":
+        print("[INFO] This run is still in progress - manage it after it completes.")
+        return 0
+    try:
+        if run_kind(data) == "test":
+            answer = input(
+                "Test run: [p]romote to archive-bound, [d]elete from disk, blank = cancel: "
+            ).strip().lower()
+            if answer.startswith("p"):
+                set_run_kind(run, "archive")
+                _relocate_run(run, test=False)
+                print(f"[INFO] '{run.name}' is now archive-bound - push it via menu option 5.")
+            elif answer.startswith("d"):
+                confirm = input(f"Delete '{run.name}' permanently? [y/N]: ").strip().lower()
+                if confirm.startswith("y"):
+                    delete_test_run(run)
+                    print(f"[INFO] Deleted test run: {run.name}")
+            return 0
+        if data.get("archive_status") in ("transfer_pending", "archived_verified", "cleanup_eligible"):
+            print("[INFO] This run is already on (or on its way to) the cluster archive - "
+                  "it cannot become a test run.")
+            return 0
+        answer = input(
+            f"Mark '{run.name}' as a test run (stays local, never archived)? [y/N]: "
+        ).strip().lower()
+        if answer.startswith("y"):
+            set_run_kind(run, "test")
+            _relocate_run(run, test=True)
+            print("[INFO] Marked as a test run - delete it anytime via this menu.")
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"[WARN] {exc}")
+        return 1
+    return 0
+
+
 def interactive_menu() -> int:
     print("PAI hardware - GPU power monitor")
     print("=================================")
@@ -441,12 +607,15 @@ def interactive_menu() -> int:
     print("  3) Open dashboard - latest run (live)    [demo]")
     print("  4) Open dashboard - replay a past run    [demo]")
     print("  5) Archive a run (Globus -> cluster archive)")
-    print("  6) Quit")
-    choice = input("Select [1-6]: ").strip()
+    print("  6) Manage a test run (promote / delete)")
+    print("  7) Quit")
+    choice = input("Select [1-7]: ").strip()
     if choice in {"1", "2"}:
-        name = input("Measurement name (blank = auto 'GPU Run N'): ").strip() or None
+        test = input("Test run? Stays local, never archived [y/N]: ").strip().lower().startswith("y")
+        auto = _TEST_NAME_PREFIX if test else _AUTO_NAME_PREFIX
+        name = input(f"Measurement name (blank = auto '{auto} N'): ").strip() or None
         simulate = input("Use simulated data (no NI hardware)? [y/N]: ").strip().lower().startswith("y")
-        return run_hardware(simulate=simulate, display=(choice == "2"), name=name)
+        return run_hardware(simulate=simulate, display=(choice == "2"), name=name, test=test)
     if choice == "3":
         latest = _latest_run()
         if latest is None:
@@ -462,6 +631,8 @@ def interactive_menu() -> int:
     if choice == "5":
         return _menu_archive()
     if choice == "6":
+        return _menu_test_runs()
+    if choice == "7":
         return 0
     print("[WARN] Unrecognized choice.")
     return 1
@@ -480,6 +651,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hw.add_argument("--simulate", action="store_true", help="Run without NI hardware.")
     p_hw.add_argument("--display", action="store_true", help="Also open the live dashboard.")
     p_hw.add_argument("--name", help="Measurement name for this run.")
+    p_hw.add_argument(
+        "--test",
+        action="store_true",
+        help="Test run: stays local, never archived; delete at will with `pai runs delete`.",
+    )
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
     p_hw.add_argument("--duration-sec", type=float, help="Optional finite duration for smoke tests.")
@@ -504,6 +680,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archived copy's path for mark-archived (default: <archive_root>/<run_id>).",
     )
 
+    p_runs = sub.add_parser("runs", help="List runs, or manage test runs vs archive-bound runs.")
+    p_runs.add_argument("action", choices=["list", "promote", "demote", "delete"])
+    p_runs.add_argument("run", nargs="?", help="Run directory or name (not needed for list).")
+
     return parser
 
 
@@ -522,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
             simulate=args.simulate,
             display=args.display,
             name=args.name,
+            test=args.test,
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,
@@ -545,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
             archive_root=args.archive_root,
             destination=Path(args.destination) if args.destination else None,
         )
+    if args.command == "runs":
+        return run_runs(args.action, args.run)
     parser.print_help()
     return 1
 

@@ -19,6 +19,18 @@ def utc_now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+# Test runs live in their own subfolder so anyone browsing output/ (or a run
+# selector) sees at a glance what is real data and what is disposable scratch.
+# The manifest's run_kind stays the source of truth; the folder is derived.
+TEST_RUNS_SUBDIR = "test"
+
+
+def runs_root(output_root: Path, *, test: bool) -> Path:
+    """Where runs of this kind live: ``<output_root>`` or ``<output_root>/test``."""
+    root = Path(output_root)
+    return root / TEST_RUNS_SUBDIR if test else root
+
+
 def sanitize_folder_name(name: str) -> str:
     name = name.strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)

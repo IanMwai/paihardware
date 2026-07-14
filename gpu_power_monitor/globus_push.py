@@ -21,7 +21,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .archive import mark_archived
+from .archive import mark_archived, run_kind
 from .config import GlobusConfig
 from .manifest import load_manifest, update_manifest
 from .utils import utc_now_iso
@@ -139,6 +139,11 @@ def push_run(run_dir: Path, cfg: GlobusConfig, archive_root: Path) -> str:
     if reason:
         raise GlobusUnavailable(reason)
     data = load_manifest(run_dir)
+    if run_kind(data) == "test":
+        raise RuntimeError(
+            f"'{run_dir.name}' is a test run (local only) - promote it first: "
+            f'pai runs promote "{run_dir.name}"'
+        )
     if data.get("status") != "completed":
         raise RuntimeError(
             f"Run is not completed (status: {data.get('status')!r}) - only closed runs are archived"

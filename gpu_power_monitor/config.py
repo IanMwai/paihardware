@@ -105,6 +105,10 @@ class AcquisitionConfig:
     sample_rate_hz: int = 10000
     chunk_size: int = 1000
     measurement_name: str = "GPU Power Measurement Test"
+    # True marks the run as local scratch: never archived to the cluster and
+    # deletable at will (`pai runs delete`). Set per run with `pai hardware
+    # --test` or the menu prompt, not via the config file.
+    test_run: bool = False
     channels: ChannelConfig = field(default_factory=ChannelConfig)
     scaling: ScalingConfig = field(default_factory=ScalingConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)

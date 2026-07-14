@@ -173,6 +173,14 @@ pai hardware --simulate --display
 
 For a finite smoke test, add `--duration-sec 10`.
 
+A run that should **not** end up on the cluster (trying a feature, checking
+wiring) is started with `--test` — see
+[Test runs (local scratch)](#test-runs-local-scratch):
+
+```bash
+pai hardware --test --simulate
+```
+
 Runs are written under `output/<measurement_name>_<timestamp>/`. Press `Ctrl+C`
 to stop a run cleanly.
 
@@ -190,6 +198,9 @@ flags: `--port <n>` and `--no-browser`.
 
 Controls (in the browser):
 
+- Hovering a panel shows a **measurement cursor**: a time line mirrored across
+  all three panels with the voltage, current, and power values at that instant
+  snapped to the traces. Works live, paused, zoomed, and in replay.
 - `p`: pause/resume the display only (the run keeps acquiring and logging).
   During replay this is play/pause.
 - `z`: zoom. Pauses the display, then drag a box on any panel to zoom in.
@@ -369,6 +380,35 @@ is not actually mounted, so it cannot silently copy to the local disk):
 pai archive copy output/<run_id>
 pai archive status output/<run_id>
 ```
+
+## Test runs (local scratch)
+
+Not every run belongs on FASRC. A run started with `pai hardware --test` (or
+by answering "y" to the test-run prompt in the menu) is marked
+`run_kind: test` in its manifest and:
+
+- is **never archived**: the automatic push skips it, and
+  `pai archive push`/`copy` refuse it;
+- **can be deleted at will**, without the archived-and-past-retention rules
+  that protect real runs:
+
+  ```bash
+  pai runs delete "Test Run 0_20260714_121045"
+  ```
+
+Unnamed test runs auto-name as `Test Run 0`, `Test Run 1`, … (separate from
+the `GPU Run N` counter). Manage the split with `pai runs`:
+
+```bash
+pai runs list             # every local run with its kind + archive state
+pai runs promote <run>    # test -> archive-bound (then push it as usual)
+pai runs demote <run>     # archive-bound -> test; refused once the run is on
+                          # (or on its way to) the cluster
+pai runs delete <run>     # delete a test run (refuses archive-bound runs)
+```
+
+Menu option 6 does the same interactively. Runs recorded before this feature
+existed count as archive-bound, so nothing older becomes deletable.
 
 ## Local cleanup
 
