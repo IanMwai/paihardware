@@ -1,9 +1,12 @@
 # PAI Hardware — GPU Power Monitor
 
 High-rate GPU power measurement for the PAI hardware initiative (Le Xie lab and
-Minlan Yu lab). The system logs 10 kHz NI-DAQ voltage/current locally on the
-DAQ machine, serves a live browser dashboard, and archives completed runs to
-shared cluster storage automatically via Globus.
+Minlan Yu lab). The system logs 10 kHz NI-DAQ voltage/current for **four GPUs
+independently** on the DAQ machine, records GPU-side NVML telemetry on the
+workload machine ("gamma") over SSH for the same window, serves a live browser
+dashboard, and archives completed runs to shared cluster storage automatically
+via Globus. The long-term goal is a rich public dataset of high-resolution GPU
+power data.
 
 ## Deployment context and assumptions
 
@@ -26,14 +29,18 @@ shared cluster storage automatically via Globus.
 
 ## Pipeline at a glance
 
-1. **Acquire** : `pai hardware` reads the NI-DAQ in blocks; full-resolution
-   CSVs rotate every 60 s into `output/<run>_<timestamp>/`, and a small rolling
-   window (`latest.npz` + `latest_status.json`) is kept for the dashboard.
+1. **Acquire** : `pai hardware` reads all 8 NI-DAQ channels (a voltage/current
+   pair per GPU) in blocks; full-resolution CSVs with per-GPU columns rotate
+   every 60 s into `output/<run>_<timestamp>/`, and a small rolling window
+   (`latest.npz` + `latest_status.json`) is kept for the dashboard. If gamma
+   credentials are configured, an **NVML logger starts on gamma** at run start
+   (see [GPU telemetry from gamma](#gpu-telemetry-from-gamma-nvml)).
 2. **Display** : the dashboard polls that rolling window; it is a viewer only,
    so closing/pausing it never affects logging.
-3. **Close** : on stop (Ctrl+C or `--duration-sec`) the run's `manifest.json`
-   is finalized: file inventory with SHA-256 checksums, run stats, status
-   `completed` / archive status `ready_to_archive`.
+3. **Close** : on stop (Ctrl+C or `--duration-sec`) the NVML logger on gamma is
+   stopped and its files pulled into `<run>/nvml/`, then the run's
+   `manifest.json` is finalized: file inventory with SHA-256 checksums, run
+   stats, status `completed` / archive status `ready_to_archive`.
 4. **Archive** : a Globus transfer to the lab's archive path is submitted
    automatically after a clean run end (or from menu option 5 / `pai archive
    push`). Globus queues and retries while the cluster is down and
@@ -53,11 +60,12 @@ git clone https://github.com/IanMwai/paihardware.git
 cd paihardware
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e .[hardware,archive]
+pip install -e .[hardware,archive,remote]
 ```
 
 This installs the acquisition dependencies (`numpy`, `pyyaml`, `nidaqmx`), the
-Globus CLI for archiving, and creates the `pai` command. On machines without
+Globus CLI for archiving, `paramiko` for the gamma NVML link, and creates the
+`pai` command. On machines without
 the DAQ hardware (e.g. for `--simulate` runs or replaying recorded data),
 plain `pip install -e .` is enough. If `pai` is ever not on PATH, every
 `pai ...` command below also works as `python -m gpu_power_monitor.cli ...`.
@@ -89,9 +97,13 @@ notepad .env
 | `PAI_GLOBUS_REMOTE_ENDPOINT_ID` | Destination collection UUID; defaults to "Harvard FAS RC Holyoke" (serves `/n/holylabs`) | Only if archiving somewhere else |
 | `PAI_ARCHIVE_ROOT` | Archive path on the cluster; defaults to the Le Xie lab path | Other labs (e.g. Minlan's lab sets its own holylabs path) |
 | `PAI_OUTPUT_ROOT` | Local run directory; defaults to `output/` | Rarely |
+| `PAI_GAMMA_HOST` / `PAI_GAMMA_USER` | SSH host/user of the GPU workload machine for NVML logging | Machines with a gamma link |
+| `PAI_GAMMA_PASSWORD` or `PAI_GAMMA_KEY_PATH` | SSH auth for gamma (key preferred where possible) | Same |
 
 With `PAI_GLOBUS_LOCAL_ENDPOINT_ID` unset, everything still works. Runs just
 stay local, and `pai` prints how to archive them once Globus is configured.
+Likewise with the `PAI_GAMMA_*` variables unset: runs are power-only and `pai`
+notes that NVML logging was skipped.
 
 ### Per-user setup on a shared machine
 
@@ -173,6 +185,15 @@ pai hardware --simulate --display
 
 For a finite smoke test, add `--duration-sec 10`.
 
+Measure only some of the wired GPUs (labels or 1-based indices; the menu asks
+the same question). The run's CSVs, manifest, and dashboard then carry just
+those GPUs:
+
+```bash
+pai hardware --gpus 1              # GPU1 only
+pai hardware --gpus "GPU1,GPU3"    # any subset
+```
+
 A run that should **not** end up on the cluster (trying a feature, checking
 wiring) is started with `--test` — see
 [Test runs (local scratch)](#test-runs-local-scratch):
@@ -198,9 +219,13 @@ flags: `--port <n>` and `--no-browser`.
 
 Controls (in the browser):
 
+- Each GPU is one color-coded trace per panel; **click a GPU in the header
+  legend** to hide/show it everywhere (traces, autoscale, stats, totals).
+  The choice is remembered by the browser across runs and reloads.
 - Hovering a panel shows a **measurement cursor**: a time line mirrored across
   all three panels with the voltage, current, and power values at that instant
-  snapped to the traces. Works live, paused, zoomed, and in replay.
+  snapped to the traces (visible GPUs only). Works live, paused, zoomed, and
+  in replay.
 - `p`: pause/resume the display only (the run keeps acquiring and logging).
   During replay this is play/pause.
 - `z`: zoom. Pauses the display, then drag a box on any panel to zoom in.
@@ -237,6 +262,46 @@ is served downsampled (up to 50k points); the CSVs keep full resolution.
 **Tabs:** the dashboard reuses an already-open tab. If a tab from a previous
 run is still open when a new run starts on the same port, that tab reloads
 itself into the new run instead of a second tab opening.
+
+## GPU telemetry from gamma (NVML)
+
+The DAQ machine measures power at the rails; the workload machine ("gamma")
+knows what the GPUs were *doing*. With SSH credentials in `.env`
+(`PAI_GAMMA_*`, see above), every run brackets an **NVML logger on gamma**
+automatically — no human in the loop:
+
+1. At run start, `pai` SSHes into gamma, records GPU/driver metadata
+   (`nvidia-smi -L`, driver + VBIOS versions → `gamma_info.txt`), and launches
+   `nvidia-smi --query-gpu=... -lms 100` writing one CSV row per GPU per
+   interval to `pai_runs/<run_id>/nvml.csv` on gamma.
+2. At run end, the logger is stopped and everything is pulled into
+   `<run>/nvml/` **before** the manifest is finalized — so the NVML files are
+   in the checksummed inventory and travel to the FASRC archive with the power
+   data. A copy also stays on gamma as a backup.
+
+Everything is **best-effort by design**: gamma being off, unreachable, or
+unconfigured never blocks, delays, or fails a power run. The skip/failure is
+printed and recorded in the manifest (`nvml.status`), and you can retry any
+time later:
+
+```bash
+pai fetch "GPU Run 3_20260918_141530"    # or menu option 7
+```
+
+A late fetch refreshes the manifest's file inventory; if the run was already
+archived without the NVML files, `pai fetch` says so and tells you to push
+again (the re-push only transfers the missing files).
+
+Notes:
+
+- NVML/nvidia-smi refreshes at ~10 Hz — that is the point of this project
+  (10 kHz analog power next to standard NVML-rate telemetry). The actual
+  logging interval is recorded in the manifest (`nvml.interval_ms`).
+- Timestamps in `nvml.csv` come from **gamma's clock**; the manifest records
+  both machines' clocks (run `started_at` locally, `date -u` in
+  `gamma_info.txt`) for alignment during analysis.
+- Simulated runs (`--simulate`) never start the gamma logger: fake power data
+  next to real telemetry would only mislead.
 
 ## Archive storage
 
@@ -424,13 +489,20 @@ pai archive cleanup output/<run_id> --delete
 
 ## Hardware settings reference
 
-These match the lab's DAQ wiring (originally from `NI_script_VIP_1GPU_*.py`,
-kept in the repo as a legacy reference) and live in `configs/default.yaml`.
-No need to change them unless the wiring changes:
+These match the lab's 4-GPU DAQ wiring (the single-GPU originals are kept
+under `legacy/` for reference) and live in `configs/default.yaml`. No need to
+change them unless the wiring changes:
 
-- Channels: `Dev1/ai0` (voltage), `Dev1/ai1` + `Dev1/ai2` (current), `RSE`, −0.5…3.5 V
-- Voltage scale `4.768`, current scale `12.5`, sample rate `10000` Hz
-- Power moving average `10` samples, CSV chunk rotation every `60` s
+- One interleaved V/I channel pair per GPU on `Dev1`, `RSE`, −0.5…3.5 V:
+  `ai0/ai1` (GPU1), `ai2/ai3` (GPU2), `ai4/ai5` (GPU3), `ai6/ai7` (GPU4)
+- Per-GPU calibrated voltage divider ratios (12.18 V reference): `4.7411`,
+  `4.6119`, `4.6119`, `4.6067`
+- Shared 0.08 Ω shunt → current scale `12.5`; GPU2–4 shunts are wired opposite
+  to GPU1, corrected with `current_sign: -1`
+- Sample rate `10000` Hz, power moving average `10` samples, CSV chunk
+  rotation every `60` s
+- CSV columns: `time_s`, then `gpuN_voltage_v / gpuN_current_a / gpuN_power_w`
+  per GPU, then `total_power_w`
 
 ## Troubleshooting
 
@@ -446,6 +518,10 @@ No need to change them unless the wiring changes:
   or you are not logged in (`globus login`). The skip message says which.
 - **Transfer pending for a long time** → `pai archive status <run>` prints why
   it is waiting (endpoint offline, re-authentication needed, …) and what to do.
+- **"NVML logging on gamma skipped"** → the `PAI_GAMMA_*` variables are not set
+  in `.env`, or paramiko is missing (`pip install -e .[remote]`). The message
+  says which. A run that completed without NVML files can be completed later
+  with `pai fetch <run>`.
 
 ## Staying up to date, and contributing
 
