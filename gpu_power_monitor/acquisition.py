@@ -20,6 +20,7 @@ from .live_buffer import LiveBuffer
 from .logging_writer import ChunkWriter
 from .manifest import create_manifest, finalize_manifest, update_manifest
 from .processing import PowerProcessor
+from .remote import NvmlLogger, remote_unready_reason
 from .utils import runs_root, unique_run_dir
 
 
@@ -44,31 +45,67 @@ def acquire(
             runs_root(config.storage.output_root, test=config.test_run), config.measurement_name
         )
     run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
     create_manifest(run_dir, config)
     print_fn(f"[INFO] Run directory: {run_dir}")
 
+    gpus = config.channels.gpus
     source = (
-        SimulatedDaqSource(config.sample_rate_hz, config.chunk_size)
+        SimulatedDaqSource(
+            config.sample_rate_hz,
+            config.chunk_size,
+            gpus=gpus,
+            current_scale=config.scaling.current_scale,
+        )
         if simulate
         else NIDaqSource(config.channels, config.sample_rate_hz, config.chunk_size)
     )
     processor = PowerProcessor(
         sample_rate_hz=config.sample_rate_hz,
-        voltage_scale=config.scaling.voltage_scale,
+        gpus=gpus,
         current_scale=config.scaling.current_scale,
         voltage_delay_samples=config.processing.voltage_delay_samples,
         current_delay_samples=config.processing.current_delay_samples,
         power_average_samples=config.processing.power_average_samples,
     )
+    # e.g. nidaq_Dev1_ai0_ai7_4GPU (first voltage channel to last current channel)
+    prefix = (
+        f"{config.logging.file_prefix}_{config.channels.device}"
+        f"_{gpus[0].voltage}_{gpus[-1].current}_{len(gpus)}GPU"
+    )
     writer = ChunkWriter(
         out_dir=run_dir,
-        prefix=f"{config.logging.file_prefix}_{config.channels.device}_{config.channels.voltage}_{config.channels.current1}_{config.channels.current2}",
+        prefix=prefix,
         chunk_len_sec=config.logging.chunk_duration_sec,
         start_wall_dt=dt.datetime.now(),
+        labels=config.channels.labels,
         queue_blocks=config.logging.queue_blocks,
         file_format=config.logging.format,
     )
-    live = LiveBuffer(run_dir, config.sample_rate_hz, config.display.window_sec)
+    live = LiveBuffer(
+        run_dir, config.sample_rate_hz, config.display.window_sec, config.channels.labels
+    )
+
+    # NVML logging on gamma brackets the power run so both data streams cover
+    # the same window. Best-effort throughout: gamma being down never blocks
+    # or aborts a power run.
+    nvml: NvmlLogger | None = None
+    if simulate:
+        pass  # simulated data + real GPU telemetry would only mislead
+    elif (reason := remote_unready_reason(config.remote)) is not None:
+        print_fn(f"[INFO] NVML logging on gamma skipped: {reason}")
+    else:
+        nvml = NvmlLogger(config.remote, run_dir.name)
+        try:
+            nvml.start()
+            print_fn(
+                f"[INFO] NVML logger running on {config.remote.host} "
+                f"(~{run_dir.name}/nvml.csv every {config.remote.nvml_interval_ms} ms)"
+            )
+        except Exception as exc:
+            print_fn(f"[WARN] Could not start the NVML logger on gamma: {exc}")
+            nvml = None
+
     start = time.time()
     failed = False
     source.start()
@@ -83,12 +120,14 @@ def acquire(
                 time.sleep(0.01)
                 continue
             n_to_read = min(max(available, 1), config.chunk_size * 10)
-            raw_v, raw_i1, raw_i2 = source.read(n_to_read)
-            block = processor.process(raw_v, raw_i1, raw_i2)
+            raw_voltages, raw_currents = source.read(n_to_read)
+            if not raw_voltages:
+                continue
+            block = processor.process(raw_voltages, raw_currents)
             writer.write_block(block)
             live.append(block, state="LIVE")
             if simulate:
-                time.sleep(len(raw_v) / float(config.sample_rate_hz))
+                time.sleep(len(raw_voltages[0]) / float(config.sample_rate_hz))
     except KeyboardInterrupt:
         print_fn("[INFO] Acquisition interrupted by user.")
     except Exception as exc:
@@ -100,6 +139,16 @@ def acquire(
         source.stop()
         end_time = processor.sample_index / float(config.sample_rate_hz)
         writer.finalize(end_time)
+        if nvml is not None:
+            # Fetch before finalize so the NVML files land in the manifest's
+            # checksummed inventory (and therefore in the Globus archive).
+            result = nvml.stop_and_fetch(run_dir / "nvml")
+            update_manifest(run_dir, nvml=result)
+            if result.get("status") == "fetched":
+                print_fn(f"[INFO] NVML files fetched from gamma: {', '.join(result['files'])}")
+            else:
+                print_fn(f"[WARN] NVML fetch failed: {result.get('error')}")
+                print_fn(f'[INFO] Retry later with: pai fetch "{run_dir.name}"')
         if not failed:
             # On failure the manifest already says status=error and the live
             # state ERROR; finalizing here would overwrite both with "completed".

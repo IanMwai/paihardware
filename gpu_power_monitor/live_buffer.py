@@ -30,19 +30,20 @@ class LiveBuffer:
         run_dir: Path,
         sample_rate_hz: float,
         window_sec: float,
+        labels: list[str],
         max_points: int = 2500,
     ):
         self.run_dir = Path(run_dir)
         self.sample_rate_hz = float(sample_rate_hz)
         self.window_sec = float(window_sec)
+        self.labels = list(labels)
         self.max_points = int(max_points)
         points = max(1, int(self.sample_rate_hz * self.window_sec))
         self.time_s = deque(maxlen=points)
-        self.voltage_v = deque(maxlen=points)
-        self.current_a = deque(maxlen=points)
-        self.current1_a = deque(maxlen=points)
-        self.current2_a = deque(maxlen=points)
-        self.power_w = deque(maxlen=points)
+        self.voltage_v = [deque(maxlen=points) for _ in self.labels]
+        self.current_a = [deque(maxlen=points) for _ in self.labels]
+        self.power_w = [deque(maxlen=points) for _ in self.labels]
+        self.total_power = deque(maxlen=points)
         self.status_path = self.run_dir / "latest_status.json"
         self.data_path = self.run_dir / "latest.npz"
         # whole-run accumulators (not limited to the on-screen window)
@@ -53,11 +54,11 @@ class LiveBuffer:
 
     def append(self, block: ProcessedBlock, state: str = "LIVE") -> None:
         self.time_s.extend(block.time_s.tolist())
-        self.voltage_v.extend(block.voltage_v.tolist())
-        self.current_a.extend(block.total_current_a.tolist())
-        self.current1_a.extend(block.current1_a.tolist())
-        self.current2_a.extend(block.current2_a.tolist())
-        self.power_w.extend(block.total_power_w.tolist())
+        for g in range(len(self.labels)):
+            self.voltage_v[g].extend(block.voltage_v[g].tolist())
+            self.current_a[g].extend(block.current_a[g].tolist())
+            self.power_w[g].extend(block.power_w[g].tolist())
+        self.total_power.extend(block.total_power_w.tolist())
         self._accumulate_run_stats(block)
         self.write_latest(state=state)
 
@@ -74,15 +75,7 @@ class LiveBuffer:
     def write_latest(self, state: str) -> None:
         arrays = self._downsample()
         buffer = io.BytesIO()
-        np.savez(
-            buffer,
-            time_s=arrays["time_s"],
-            voltage_v=arrays["voltage_v"],
-            total_current_a=arrays["total_current_a"],
-            current1_a=arrays["current1_a"],
-            current2_a=arrays["current2_a"],
-            total_power_w=arrays["total_power_w"],
-        )
+        np.savez(buffer, **arrays)
         atomic_replace_bytes(self.data_path, buffer.getvalue())
         latest = float(arrays["time_s"][-1]) if arrays["time_s"].size else None
         snapshot = LiveSnapshot(
@@ -100,14 +93,15 @@ class LiveBuffer:
         self.write_latest(state)
 
     def _downsample(self) -> dict[str, np.ndarray]:
-        arrays = {
-            "time_s": np.asarray(self.time_s, dtype=float),
-            "voltage_v": np.asarray(self.voltage_v, dtype=float),
-            "total_current_a": np.asarray(self.current_a, dtype=float),
-            "current1_a": np.asarray(self.current1_a, dtype=float),
-            "current2_a": np.asarray(self.current2_a, dtype=float),
-            "total_power_w": np.asarray(self.power_w, dtype=float),
-        }
+        # npz/JSON keys mirror the CSV columns (gpu1_voltage_v, ...); the
+        # dashboard discovers the GPUs by scanning for *_voltage_v keys.
+        arrays = {"time_s": np.asarray(self.time_s, dtype=float)}
+        for g, label in enumerate(self.labels):
+            gpu = label.lower()
+            arrays[f"{gpu}_voltage_v"] = np.asarray(self.voltage_v[g], dtype=float)
+            arrays[f"{gpu}_current_a"] = np.asarray(self.current_a[g], dtype=float)
+            arrays[f"{gpu}_power_w"] = np.asarray(self.power_w[g], dtype=float)
+        arrays["total_power_w"] = np.asarray(self.total_power, dtype=float)
         n = arrays["time_s"].size
         if n <= self.max_points:
             return arrays

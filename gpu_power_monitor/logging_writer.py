@@ -12,7 +12,18 @@ from .processing import ProcessedBlock
 from .utils import fmt_hhmmss_ms, rename_with_fallback
 
 
-CSV_HEADER = ["time_s", "voltage_v", "current1_a", "current2_a", "total_power_w"]
+def csv_header(labels: list[str]) -> list[str]:
+    """Per-GPU V/I/P columns plus the summed power, e.g. gpu1_voltage_v, ...
+
+    total_power_w stays a real column (not derived) so run stats and replay
+    read one canonical series regardless of GPU count.
+    """
+    header = ["time_s"]
+    for label in labels:
+        gpu = label.lower()
+        header.extend([f"{gpu}_voltage_v", f"{gpu}_current_a", f"{gpu}_power_w"])
+    header.append("total_power_w")
+    return header
 
 
 class ChunkWriter:
@@ -22,6 +33,7 @@ class ChunkWriter:
         prefix: str,
         chunk_len_sec: float,
         start_wall_dt: dt.datetime,
+        labels: list[str],
         queue_blocks: int = 200,
         file_format: str = "csv",
     ):
@@ -29,6 +41,8 @@ class ChunkWriter:
             raise NotImplementedError("Only CSV writing is implemented")
         self.out_dir = Path(out_dir)
         self.prefix = prefix
+        self.labels = list(labels)
+        self.header = csv_header(self.labels)
         self.chunk_len = float(chunk_len_sec)
         self.start_wall = start_wall_dt
         self.queue: queue.Queue[ProcessedBlock] = queue.Queue(maxsize=int(queue_blocks))
@@ -84,13 +98,11 @@ class ChunkWriter:
                 self._close_and_rename(self._last_written_t_end)
 
     def _write_block_locked(self, block: ProcessedBlock) -> None:
-        n = min(
-            block.time_s.size,
-            block.voltage_v.size,
-            block.current1_a.size,
-            block.current2_a.size,
-            block.total_power_w.size,
-        )
+        sizes = [block.time_s.size, block.total_power_w.size]
+        sizes += [arr.size for arr in block.voltage_v]
+        sizes += [arr.size for arr in block.current_a]
+        sizes += [arr.size for arr in block.power_w]
+        n = min(sizes) if sizes else 0
         if n == 0:
             return
         with self.lock:
@@ -105,16 +117,20 @@ class ChunkWriter:
                 if mask_end == idx:
                     self._close_and_rename(chunk_end)
                     continue
-                rows = (
-                    (
-                        f"{float(block.time_s[k]):.9f}",
-                        f"{float(block.voltage_v[k]):.9f}",
-                        f"{float(block.current1_a[k]):.9f}",
-                        f"{float(block.current2_a[k]):.9f}",
-                        f"{float(block.total_power_w[k]):.9f}",
-                    )
-                    for k in range(idx, mask_end)
-                )
+                def make_row(k: int) -> list[str]:
+                    row = [f"{float(block.time_s[k]):.9f}"]
+                    for g in range(len(block.voltage_v)):
+                        row.extend(
+                            [
+                                f"{float(block.voltage_v[g][k]):.9f}",
+                                f"{float(block.current_a[g][k]):.9f}",
+                                f"{float(block.power_w[g][k]):.9f}",
+                            ]
+                        )
+                    row.append(f"{float(block.total_power_w[k]):.9f}")
+                    return row
+
+                rows = (make_row(k) for k in range(idx, mask_end))
                 assert self.writer is not None
                 self.writer.writerows(rows)
                 self._last_written_t_end = max(
@@ -142,7 +158,7 @@ class ChunkWriter:
         self.tmp_path = self.out_dir / f"{self.prefix}_{date_str}_{start_str}_to_PENDING.csv"
         self._file = open(self.tmp_path, "w", newline="", encoding="utf-8")
         self.writer = csv.writer(self._file)
-        self.writer.writerow(CSV_HEADER)
+        self.writer.writerow(self.header)
 
     def _close_and_rename(self, chunk_end_sec: float) -> None:
         if self._file is None:

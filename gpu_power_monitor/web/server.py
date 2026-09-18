@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,26 +16,43 @@ from ..live_buffer import read_live_status
 
 
 def read_history_csv(run_dir: Path) -> dict[str, np.ndarray]:
-    values = {
-        "time_s": [],
-        "voltage_v": [],
-        "total_current_a": [],
-        "total_power_w": [],
-    }
-    for path in sorted(Path(run_dir).glob("*.csv")):
+    """Full-run series from the CSVs, keyed like the live payload.
+
+    New-format runs already use per-GPU columns (gpu1_voltage_v, ...). Legacy
+    single-GPU runs (voltage_v / current1_a / current2_a) are mapped onto one
+    synthetic "gpu1" so old runs replay in the multi-GPU dashboard.
+    """
+    paths = sorted(Path(run_dir).glob("*.csv"))
+    if not paths:
+        return {"time_s": np.empty(0, dtype=float)}
+    with open(paths[0], newline="", encoding="utf-8") as handle:
+        header = next(csv.reader(handle), [])
+    legacy = "voltage_v" in header
+    if legacy:
+        columns = ["time_s", "voltage_v", "current1_a", "current2_a", "total_power_w"]
+    else:
+        columns = [name for name in header if name == "time_s" or name.endswith(("_voltage_v", "_current_a", "_power_w"))]
+    values: dict[str, list[float]] = {name: [] for name in columns}
+    for path in paths:
         with open(path, newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 try:
-                    values["time_s"].append(float(row["time_s"]))
-                    values["voltage_v"].append(float(row["voltage_v"]))
-                    c1 = float(row["current1_a"])
-                    c2 = float(row["current2_a"])
-                    values["total_current_a"].append(c1 + c2)
-                    values["total_power_w"].append(float(row["total_power_w"]))
-                except (KeyError, ValueError):
+                    parsed = [float(row[name]) for name in columns]
+                except (KeyError, TypeError, ValueError):
                     continue
-    return {key: np.asarray(value, dtype=float) for key, value in values.items()}
+                for name, value in zip(columns, parsed):
+                    values[name].append(value)
+    arrays = {key: np.asarray(value, dtype=float) for key, value in values.items()}
+    if legacy:
+        arrays = {
+            "time_s": arrays["time_s"],
+            "gpu1_voltage_v": arrays["voltage_v"],
+            "gpu1_current_a": arrays["current1_a"] + arrays["current2_a"],
+            "gpu1_power_w": arrays["total_power_w"],
+            "total_power_w": arrays["total_power_w"],
+        }
+    return arrays
 
 WEB_DIR = Path(__file__).resolve().parent
 INDEX_PATH = WEB_DIR / "index.html"
@@ -163,15 +182,77 @@ def _make_handler(run_dir: Path, display: dict, activity: dict | None = None):
                     self._send_json(build_history_payload(run_dir))
                 else:
                     self._send_json({"error": "not found"}, status=404)
-            except BrokenPipeError:
+            except ConnectionError:
+                # The browser tab closed mid-response (Windows: WinError
+                # 10053/10054, POSIX: broken pipe). Routine, not an error —
+                # and nothing can be sent back on a dead socket.
                 pass
             except Exception as exc:  # keep the server alive on a bad read
-                self._send_json({"error": str(exc)}, status=500)
+                try:
+                    self._send_json({"error": str(exc)}, status=500)
+                except ConnectionError:
+                    pass
 
         def log_message(self, *args) -> None:  # silence per-request console spam
             pass
 
     return DashboardHandler
+
+
+class _ExclusiveHTTPServer(ThreadingHTTPServer):
+    """HTTP server that refuses to share its port.
+
+    On Windows, SO_REUSEADDR (stdlib default) lets a second server bind an
+    already-serving port with no error — the old process keeps receiving all
+    traffic, so every dashboard silently shows whatever run that stale server
+    was opened on. Binding exclusively turns that into a loud OSError, which
+    serve() answers by hopping to the next free port.
+
+    On POSIX, SO_REUSEADDR is kept: there it does not allow double-binding a
+    listening port, and without it a restart within TIME_WAIT (~60 s) of the
+    previous run would fail for no user-visible reason.
+    """
+
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def handle_error(self, request, client_address) -> None:
+        # Backstop for disconnects that happen outside the handler's own
+        # try/except (e.g. while the request line is still being read): a
+        # closing browser tab is routine and must not spew tracebacks.
+        import sys
+
+        exc = sys.exc_info()[1]
+        if isinstance(exc, ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
+def create_server(host: str, port: int, handler, max_tries: int = 10):
+    """Bind the dashboard server to `port`, or the next free port after it.
+
+    Returns (httpd, bound_port). A busy port usually means a dashboard from an
+    unfinished (possibly another user's) session is still running there.
+    """
+    last_err: OSError | None = None
+    for candidate in range(port, port + max_tries):
+        try:
+            httpd = _ExclusiveHTTPServer((host, candidate), handler)
+        except OSError as err:
+            last_err = err
+            continue
+        if candidate != port:
+            print(f"[WARN] Port {port} is in use (a dashboard from another session?) - "
+                  f"using port {candidate} instead.")
+        return httpd, candidate
+    raise OSError(
+        f"No free dashboard port in {port}-{port + max_tries - 1} "
+        f"(is a stale dashboard hogging them? last error: {last_err})"
+    )
 
 
 def _wait_for_existing_client(activity: dict, wait_sec: float = 1.5) -> bool:
@@ -201,7 +282,7 @@ def serve(
     display = {**DEFAULT_DISPLAY, **(display or {})}
     activity = {"last_poll": 0.0}
     handler = _make_handler(run_dir, display, activity)
-    httpd = ThreadingHTTPServer((host, port), handler)
+    httpd, port = create_server(host, port, handler)
     url = f"http://{host}:{port}/"
     print(f"[INFO] Dashboard for {run_dir.name} at {url}")
     print("[INFO] Press Ctrl+C to stop.")

@@ -2,17 +2,23 @@ sample_rate_hz: 10000
 chunk_size: 1000
 measurement_name: "GPU Power Measurement Test"
 
+# One entry per GPU: its voltage tap / shunt channel pair, the calibrated
+# divider ratio for that tap (12.18 V reference, 2026-09 calibration), and the
+# shunt wiring sign (GPU2-4 are wired opposite to GPU1).
 channels:
   device: "Dev1"
-  voltage: "ai0"
-  current1: "ai1"
-  current2: "ai2"
   terminal: "RSE"
   min_v: -0.5
   max_v: 3.5
+  gpus:
+    # voltage_scale = 12.18 / <measured raw volts at the tap>
+    - { label: "GPU1", voltage: "ai0", current: "ai1", voltage_scale: 4.741144, current_sign: 1 }
+    - { label: "GPU2", voltage: "ai2", current: "ai3", voltage_scale: 4.611890, current_sign: -1 }
+    - { label: "GPU3", voltage: "ai4", current: "ai5", voltage_scale: 4.611890, current_sign: -1 }
+    - { label: "GPU4", voltage: "ai6", current: "ai7", voltage_scale: 4.606657, current_sign: -1 }
 
 scaling:
-  voltage_scale: 4.768
+  # Shared 0.08 ohm shunt: scaled_current = raw * 12.5
   current_scale: 12.5
 
 processing:
@@ -35,6 +41,18 @@ logging:
   file_prefix: "nidaq"
   format: "csv"
   queue_blocks: 200
+
+# The GPU workload machine ("gamma"). Credentials are machine-local: set
+# PAI_GAMMA_HOST / PAI_GAMMA_USER and PAI_GAMMA_PASSWORD (or
+# PAI_GAMMA_KEY_PATH) in .env. Without credentials the NVML integration
+# disables itself; a run never depends on gamma being reachable.
+remote:
+  enabled: true
+  # NVML logs for each run live at <remote_run_root>/<run_id>/ on gamma.
+  remote_run_root: "pai_runs"
+  # nvidia-smi logging interval (ms). NVML refreshes O(10 Hz); finer adds no info.
+  nvml_interval_ms: 100
+  connect_timeout_sec: 10
 
 # Machine- and lab-specific storage values live in a `.env` file at the repo
 # root (copy `.env.example` and fill it in). Anything set there overrides the

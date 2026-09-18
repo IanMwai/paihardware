@@ -7,6 +7,11 @@
   (static run info), and renders three instrument-style panels on a <canvas>.
   No charting library — plain canvas keeps it fast and dependency-free.
 
+  Multi-GPU: the payload carries per-GPU series named like the CSV columns
+  (gpu1_voltage_v, gpu1_current_a, gpu1_power_w, ... , total_power_w). The page
+  discovers the GPUs by scanning for *_voltage_v keys, so it renders 1..N GPUs
+  without configuration (legacy single-GPU runs replay as one trace).
+
   States: LIVE (acquiring), STALE (writer stopped without an end state),
   COMPLETE (run ended cleanly), REPLAY (playing back a recorded run),
   ARCHIVED, IDLE (no data yet), ERROR (acquisition error),
@@ -25,12 +30,14 @@
     --bg:#0e0f12; --panel:#15171c; --chrome:#181a20; --grid:#23262e; --gridmaj:#353a45; --tick:#5e6675;
     --ink:#e9e6df; --muted:#949aa6; --overlay:rgba(20,22,28,.94); --line:#252932;
     --volt:#e8b54a; --curr:#56b487; --pow:#e0584f; --warn:#ff5a4d;
+    --g1:#5aa9e6; --g2:#63c96f; --g3:#e8b54a; --g4:#e0584f;
     --ok:#6fb073; --idle:#7c8493; --replay:#7e9cd8; --archived:#4bb39a; --err:#ff5a4d; --stale:#e8b54a;
   }
   body[data-theme="light"] {
     --bg:#f2f1ee; --panel:#fbfaf7; --chrome:#ecebe6; --grid:#dedcd5; --gridmaj:#c2bfb6; --tick:#9a978e;
     --ink:#23262b; --muted:#6b6f78; --overlay:rgba(255,255,255,.95); --line:#dedcd5;
     --volt:#b8860b; --curr:#2f8f63; --pow:#c0392b; --warn:#c0392b;
+    --g1:#2a6fb0; --g2:#2f8f63; --g3:#b8860b; --g4:#c0392b;
     --ok:#4e8a3c; --idle:#7c8493; --replay:#3f6bb0; --archived:#2f8a78; --err:#c0392b; --stale:#b8860b;
   }
   * { box-sizing: border-box; }
@@ -47,6 +54,13 @@
   .runSub { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .elapsedLbl { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .elapsed { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .legend { display: flex; gap: 12px; align-items: center; font-size: 13px; }
+  .legend .sw { width: 14px; height: 3px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: middle; }
+  .legend .gpu { cursor: pointer; user-select: none; padding: 3px 6px; border-radius: 7px;
+                 border: 1px solid transparent; transition: opacity .12s; }
+  .legend .gpu:hover { border-color: var(--line); }
+  .legend .gpu.off { opacity: .35; }
+  .legend .gpu.off .sw { background: var(--muted) !important; }
   .spacer { flex: 1; }
   .badge { font-weight: 700; font-size: 16px; letter-spacing: 1px; padding: 8px 18px;
            border-radius: 999px; border: 1px solid transparent; display: inline-flex; align-items: center; gap: 9px; }
@@ -71,13 +85,11 @@
   .statBox .name { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
   .statGrid { display: grid; grid-template-columns: auto auto auto; gap: 1px 8px;
               font-size: 13px; font-variant-numeric: tabular-nums; }
-  .statGrid .k { color: var(--muted); text-align: left; }
+  .statGrid .k { text-align: left; font-weight: 650; }
   .statGrid .val { text-align: right; color: var(--ink); font-weight: 650; }
   .statGrid .u { color: var(--muted); text-align: left; }
   .big { position: absolute; bottom: 12px; right: 18px; font-size: 25px; font-weight: 700; font-variant-numeric: tabular-nums; pointer-events: none; }
   .big.warn { color: var(--warn) !important; }
-  .rails { position: absolute; bottom: 12px; left: 62px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; pointer-events: none; }
-  .rails b { color: var(--ink); font-weight: 650; }
   .panel.v .name, .panel.v .big { color: var(--volt); }
   .panel.i .name, .panel.i .big { color: var(--curr); }
   .panel.p .name, .panel.p .big { color: var(--pow); }
@@ -104,6 +116,7 @@
       <div class="elapsed" id="elapsed">00:00:00</div>
       <div class="elapsedLbl">Time Elapsed</div>
     </div>
+    <div class="legend" id="legend"></div>
     <span class="spacer"></span>
     <span id="badge" class="badge idle"><span class="dot"></span><span id="badgeText">Idle</span></span>
   </header>
@@ -116,8 +129,7 @@
     </div>
     <div class="panel i">
       <canvas id="ci"></canvas>
-      <div class="statBox"><div class="name">Total Current</div><div class="statGrid" id="si"></div></div>
-      <div class="rails" id="rails"></div>
+      <div class="statBox"><div class="name">Current</div><div class="statGrid" id="si"></div></div>
       <div class="big" id="bi">—</div>
     </div>
     <div class="panel p">
@@ -160,14 +172,17 @@
 <script>
 (() => {
   "use strict";
-  // autoscale: derive the y-range from the visible data (Current, Power).
-  // Voltage stays on its fixed rail limits — it reads fine as-is.
+  // Panels draw one trace per GPU. `suffix` selects each GPU's series in the
+  // payload (key = <gpu> + suffix); autoscale derives the y-range from all
+  // visible traces (Current, Power); Voltage stays on its fixed rail limits.
   const SERIES = {
-    v: { canvas: cv, stats: sv, big: bv, src: "voltage_v",        fixed: [11.5, 13.0],   unit: "V", dp: 2, hi: 13.0, lo: 11.5, autoscale: false },
-    i: { canvas: ci, stats: si, big: bi, src: "total_current_a",  fixed: [-1.0, 15.0],   unit: "A", dp: 2, hi: 15.0, lo: null, autoscale: true },
-    p: { canvas: cp, stats: sp, big: bp, src: "total_power_w",    fixed: [-10.0, 180.0], unit: "W", dp: 1, hi: 180.0, lo: null, autoscale: true },
+    v: { canvas: cv, stats: sv, big: bv, suffix: "_voltage_v", fixed: [11.5, 13.0],   unit: "V", dp: 2, hi: 13.0, lo: 11.5, autoscale: false },
+    i: { canvas: ci, stats: si, big: bi, suffix: "_current_a", fixed: [-1.0, 15.0],   unit: "A", dp: 2, hi: 15.0, lo: null, autoscale: true },
+    p: { canvas: cp, stats: sp, big: bp, suffix: "_power_w",   fixed: [-10.0, 180.0], unit: "W", dp: 1, hi: 180.0, lo: null, autoscale: true },
   };
-  const buf = { t: [], voltage_v: [], total_current_a: [], current1_a: [], current2_a: [], total_power_w: [] };
+  // buf.gpus: lowercase keys discovered from *_voltage_v series ("gpu1", ...);
+  // buf.series: every per-GPU array plus total_power_w, keyed like the CSVs.
+  const buf = { t: [], gpus: [], series: {} };
   let cfg = { window_sec: 60, refresh_ms: 50, stale_after_sec: 2, y_limits: {}, replay: false };
   let windowSec = 60.0, defaultWindowSec = 60.0, dispPaused = false, state = "IDLE", theme = "dark";
   let dispRight = 0, elapsedVal = 0, runAvgVal = null, runPeakVal = null, energyJ = null;
@@ -177,7 +192,7 @@
   // so a recorded run renders exactly like a live one.
   let playing = false, playSpeed = 1, playPos = 0, playAtEnd = false, lastTick = null;
   const yOverride = { v: null, i: null, p: null };
-  const geom = {}; let sel = null; let C = {};
+  const geom = {}; let sel = null; let C = {}; let GPU_COLORS = [];
   // Hover cursor: pixel position on the hovered canvas. Converted to a time
   // each frame, so on a live trace the data scrolls past a fixed cursor while
   // the readout tracks; on a frozen/zoomed/replay view it acts as a static
@@ -197,13 +212,53 @@
           p: cs.getPropertyValue("--pow").trim(), grid: cs.getPropertyValue("--grid").trim(),
           gridmaj: cs.getPropertyValue("--gridmaj").trim(), tick: cs.getPropertyValue("--tick").trim(),
           overlay: cs.getPropertyValue("--overlay").trim(), ink: cs.getPropertyValue("--ink").trim() };
+    GPU_COLORS = [1,2,3,4].map(k => cs.getPropertyValue(`--g${k}`).trim());
+    renderLegend();
   }
+  const gpuColor = gi => GPU_COLORS[gi % GPU_COLORS.length];
+  const gpuName = key => key.toUpperCase();
   const fmt = (x,d=2) => Number.isFinite(x) ? x.toFixed(d) : "—";
   const histStart = () => buf.t.length ? buf.t[0] : 0;
   const histEnd = () => buf.t.length ? buf.t[buf.t.length-1] : 0;
   function curRange() {
     if (frozen) return { left: viewLeft, right: viewRight };
     const right = dispRight; return { left: Math.max(0, right-windowSec), right };
+  }
+
+  // Trace visibility: click a legend chip to hide/show that GPU everywhere
+  // (traces, autoscale, stats, hover, totals). Remembered across reloads.
+  const hidden = new Set(JSON.parse(localStorage.getItem("paiHiddenGpus") || "[]"));
+  const isHidden = g => hidden.has(g);
+  function toggleGpu(g) {
+    hidden.has(g) ? hidden.delete(g) : hidden.add(g);
+    localStorage.setItem("paiHiddenGpus", JSON.stringify([...hidden]));
+    renderLegend(); markDirty();
+  }
+  legend.addEventListener("click", e => {
+    const chip = e.target.closest(".gpu");
+    if (chip && chip.dataset.g) toggleGpu(chip.dataset.g);
+  });
+
+  // Adopt the GPU list from whichever payload just arrived (live or history).
+  function adoptSeries(d) {
+    const gpus = Object.keys(d).filter(k => k.endsWith("_voltage_v"))
+      .map(k => k.slice(0, -"_voltage_v".length)).sort();
+    if (!gpus.length) return false;
+    buf.gpus = gpus;
+    buf.series = {};
+    for (const g of gpus)
+      for (const s of ["_voltage_v", "_current_a", "_power_w"])
+        buf.series[g + s] = d[g + s] || [];
+    buf.series.total_power_w = d.total_power_w || [];
+    renderLegend();
+    return true;
+  }
+
+  function renderLegend() {
+    if (!buf.gpus.length || !GPU_COLORS.length) { setHTML(legend, ""); return; }
+    setHTML(legend, buf.gpus.map((g, gi) =>
+      `<span class="gpu${isHidden(g) ? " off" : ""}" data-g="${g}" title="Click to show/hide">` +
+      `<span class="sw" style="background:${gpuColor(gi)}"></span>${gpuName(g)}</span>`).join(""));
   }
 
   // Graticule steps snap to real units on a 1-2-5 ladder (…, 0.1, 0.2, 0.5,
@@ -219,7 +274,7 @@
     return mag * 10;
   }
 
-  // Auto y-range: center the visible trace with padding and a sane minimum span.
+  // Auto y-range: center the visible traces with padding and a sane minimum span.
   function autoRange(fin, fallback) {
     if (!fin.length) return fallback;
     let mn = Math.min(...fin), mx = Math.max(...fin);
@@ -236,14 +291,19 @@
     ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
 
     const { left, right } = curRange();
-    const T = buf.t, arr = buf[s.src];
+    const T = buf.t;
     let lo = 0; while (lo < T.length && T[lo] < left) lo++;
     let hi = T.length; while (hi > lo && T[hi-1] > right) hi--;
-    const vis = arr.slice(lo, hi);
-    const fin = vis.filter(Number.isFinite);
+    const traces = buf.gpus.map(g => buf.series[g + s.suffix] || []);
+    const finAll = [];
+    for (let gi = 0; gi < traces.length; gi++) {
+      if (isHidden(buf.gpus[gi])) continue;
+      const arr = traces[gi];
+      for (let k = lo; k < hi; k++) if (Number.isFinite(arr[k])) finAll.push(arr[k]);
+    }
     let ymin, ymax;
     if (yOverride[key]) { [ymin, ymax] = yOverride[key]; }       // manual zoom box
-    else if (s.autoscale) { [ymin, ymax] = autoRange(fin, s.fixed); }
+    else if (s.autoscale) { [ymin, ymax] = autoRange(finAll, s.fixed); }
     else { [ymin, ymax] = s.fixed; }
 
     const padL = 56, padR = 12, padT = 8, padB = (key==="p") ? 24 : 12;
@@ -279,10 +339,12 @@
         ctx.fillText((tv*xScale).toFixed(decX)+" "+xUnit, xx, y1+5);
     }
 
-    if (hi-lo > 1) {
+    for (let gi = 0; gi < traces.length; gi++) {
+      const arr = traces[gi];
+      if (hi - lo < 2 || !arr.length || isHidden(buf.gpus[gi])) continue;
       ctx.beginPath();
       for (let k=lo;k<hi;k++){ const xx=xOf(T[k]), yy=yOf(arr[k]); k===lo?ctx.moveTo(xx,yy):ctx.lineTo(xx,yy); }
-      ctx.strokeStyle = C[key]; ctx.lineWidth = 1.4; ctx.stroke();
+      ctx.strokeStyle = gpuColor(gi); ctx.lineWidth = 1.4; ctx.stroke();
     }
     if (state === "IDLE") { ctx.fillStyle = "rgba(128,128,128,.22)"; ctx.fillRect(0,0,W,H); }
 
@@ -293,8 +355,8 @@
     }
 
     // Hover cursor: a time cursor mirrored on every panel (all share the time
-    // axis), a dot snapped to the nearest sample with a value chip, and the
-    // time readout on the hovered panel. Hidden while a zoom box is dragged.
+    // axis) with a snapped dot per GPU trace. Value chips render only on the
+    // hovered panel (one per GPU) so the other panels stay uncluttered.
     if (hover && !sel && hi - lo > 0) {
       const hg = geom[hover.key];
       if (hg && hover.x >= hg.x0 && hover.x <= hg.x1) {
@@ -306,12 +368,15 @@
           ctx.beginPath(); ctx.moveTo(xx,y0); ctx.lineTo(xx,y1); ctx.stroke();
           ctx.restore();
           const idx = nearestIdx(T, tCur, lo, hi);
-          const val = arr[idx];
-          if (Number.isFinite(val)) {
+          for (let gi = 0; gi < traces.length; gi++) {
+            if (isHidden(buf.gpus[gi])) continue;
+            const val = traces[gi][idx];
+            if (!Number.isFinite(val)) continue;
             const dx = xOf(T[idx]), dy = Math.max(y0, Math.min(y1, yOf(val)));
-            ctx.fillStyle = C[key];
+            ctx.fillStyle = gpuColor(gi);
             ctx.beginPath(); ctx.arc(dx, dy, 3, 0, Math.PI*2); ctx.fill();
-            cursorChip(ctx, `${fmt(val,s.dp)} ${s.unit}`, dx, dy, x0, x1, y0, y1);
+            if (hover.key === key)
+              cursorChip(ctx, `${gpuName(buf.gpus[gi])} ${fmt(val,s.dp)} ${s.unit}`, dx, dy, x0, x1, y0, y1);
           }
           if (hover.key === key) {
             // ms once the view is deeply zoomed, matching the axis labels.
@@ -322,18 +387,46 @@
       }
     }
 
-    if (fin.length) {
-      const mean = fin.reduce((a,b)=>a+b,0)/fin.length;
-      const std = Math.sqrt(fin.reduce((a,b)=>a+(b-mean)*(b-mean),0)/fin.length);
-      const peak = Math.max(...fin);
-      setHTML(s.stats, [["Avg",fmt(mean,s.dp)],["Std",fmt(std,s.dp)],["Peak",fmt(peak,s.dp)]]
-        .map(([k,val])=>`<span class="k">${k}</span><span class="val">${val}</span><span class="u">${s.unit}</span>`).join(""));
-      const cur = fin[fin.length-1];
-      setText(s.big, `${fmt(cur,s.dp)} ${s.unit}`);
-      s.big.classList.toggle("warn", (s.hi!=null&&cur>s.hi)||(s.lo!=null&&cur<s.lo));
-    }
+    updateStats(key, s, traces, lo, hi);
   }
   function drawAll() { for (const k in SERIES) drawPanel(k); }
+
+  // Per-GPU stat rows (avg over the visible window + latest), plus a Total row
+  // on the Current and Power panels. The big number: V = latest across-GPU
+  // mean, I = latest total current, P = latest total power.
+  function updateStats(key, s, traces, lo, hi) {
+    const rows = [];
+    const latest = [];
+    let shown = 0;
+    for (let gi = 0; gi < traces.length; gi++) {
+      if (isHidden(buf.gpus[gi])) continue;
+      shown++;
+      const vis = traces[gi].slice(lo, hi).filter(Number.isFinite);
+      const cur = vis.length ? vis[vis.length-1] : NaN;
+      latest.push(cur);
+      const mean = vis.length ? vis.reduce((a,b)=>a+b,0)/vis.length : NaN;
+      rows.push(`<span class="k" style="color:${gpuColor(gi)}">${gpuName(buf.gpus[gi])}</span>` +
+                `<span class="val">${fmt(mean,s.dp)}</span><span class="u">${s.unit}</span>`);
+    }
+    let big = NaN, warn = false;
+    const finLatest = latest.filter(Number.isFinite);
+    if (finLatest.length) {
+      if (key === "v") {
+        big = finLatest.reduce((a,b)=>a+b,0)/finLatest.length;
+        warn = finLatest.some(v => (s.hi!=null&&v>s.hi)||(s.lo!=null&&v<s.lo));
+      } else {
+        // Total of the *visible* GPUs, so hiding traces reads consistently.
+        big = finLatest.reduce((a,b)=>a+b,0);
+        warn = (s.hi!=null&&big>s.hi)||(s.lo!=null&&big<s.lo);
+        if (shown > 1)
+          rows.push(`<span class="k" style="color:var(--muted)">Total</span>` +
+                    `<span class="val">${fmt(big,s.dp)}</span><span class="u">${s.unit}</span>`);
+      }
+    }
+    setHTML(s.stats, rows.join(""));
+    setText(s.big, Number.isFinite(big) ? `${fmt(big,s.dp)} ${s.unit}` : "—");
+    s.big.classList.toggle("warn", warn);
+  }
 
   // Index of the sample nearest to time t within T[lo:hi] (T is sorted).
   function nearestIdx(T, t, lo, hi) {
@@ -377,13 +470,11 @@
   function updateChrome() {
     setText(elapsed, hhmmss(replayMode && !frozen ? playPos : elapsedVal));
     setText(winLabel, windowSec.toFixed(1));
-    if (buf.current1_a.length) { const a=buf.current1_a.at(-1), b=buf.current2_a.at(-1);
-      if (Number.isFinite(a) && Number.isFinite(b))
-        setHTML(rails, `I1 <b>${fmt(a,2)} A</b> · I2 <b>${fmt(b,2)} A</b> · Δ <b>${fmt(Math.abs(a-b),2)} A</b>`); }
     const { left, right } = curRange();
+    const totP = buf.series.total_power_w || [];
     let lo=0; while (lo<buf.t.length && buf.t[lo]<left) lo++;
     let hi=buf.t.length; while (hi>lo && buf.t[hi-1]>right) hi--;
-    const winP = buf.total_power_w.slice(lo,hi).filter(Number.isFinite);
+    const winP = totP.slice(lo,hi).filter(Number.isFinite);
     setText(winAvg, winP.length ? `${fmt(winP.reduce((a,b)=>a+b,0)/winP.length,1)} W` : "—");
     setText(winPeak, winP.length ? `${fmt(Math.max(...winP),1)} W` : "—");
     setText(runAvg, runAvgVal!=null ? `${fmt(runAvgVal,1)} W` : "—");
@@ -420,11 +511,8 @@
         ? Math.max(0, d.server_epoch - d.generated_at_epoch) : null;
       elapsedVal = d.elapsed_s ?? d.latest_sample_time_s ?? elapsedVal;
       runAvgVal = d.run_avg_power_w ?? null; runPeakVal = d.run_peak_power_w ?? null; energyJ = d.energy_j ?? null;
-      if (!dispPaused && !frozen && Array.isArray(d.time_s) && d.time_s.length) {
+      if (!dispPaused && !frozen && Array.isArray(d.time_s) && d.time_s.length && adoptSeries(d)) {
         buf.t = d.time_s;
-        buf.voltage_v = d.voltage_v || []; buf.total_current_a = d.total_current_a || [];
-        buf.current1_a = d.current1_a || []; buf.current2_a = d.current2_a || [];
-        buf.total_power_w = d.total_power_w || [];
         dispRight = buf.t[buf.t.length-1];
       }
       markDirty();
@@ -565,13 +653,9 @@
     } catch (e) {}
     try {
       const h = await (await fetch("/api/history", { cache: "no-store" })).json();
-      if (Array.isArray(h.time_s) && h.time_s.length) {
+      if (Array.isArray(h.time_s) && h.time_s.length && adoptSeries(h)) {
         state = "REPLAY";
         buf.t = h.time_s;
-        buf.voltage_v = h.voltage_v || []; buf.total_current_a = h.total_current_a || [];
-        buf.total_power_w = h.total_power_w || [];
-        buf.current1_a = []; buf.current2_a = [];   // not stored in history CSVs
-        setHTML(rails, "");
         playPos = histStart(); dispRight = playPos;
         setSpeed(1, spd1); setPlaying(true);
       } else { state = "IDLE"; }

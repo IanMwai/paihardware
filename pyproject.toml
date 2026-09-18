@@ -18,6 +18,8 @@ dependencies = [
 hardware = ["nidaqmx"]
 # Globus CLI for archive pushes to the cluster.
 archive = ["globus-cli"]
+# SSH/SFTP link to gamma (NVML logging + file fetch).
+remote = ["paramiko"]
 dev = ["pytest"]
 
 [project.scripts]

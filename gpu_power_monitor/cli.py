@@ -8,6 +8,7 @@ Two layers over the same underlying workflows:
       pai dashboard <run> [--replay]      # open a dashboard on a run
       pai archive push|copy|verify|status|cleanup|mark-archived <run>
       pai runs list|promote|demote|delete [run]  # test runs vs archive-bound runs
+      pai fetch <run>                     # retry pulling NVML files from gamma
 
 * An interactive **menu** for the lab-demo persona, shown when `pai` is run with
   no arguments. It favors fast uptime and quick live/replay viewing.
@@ -189,6 +190,43 @@ def run_archive(command: str, run_dir: Path, **kwargs) -> int:
     return 0
 
 
+def run_fetch(run: str | Path, *, config_path: Path | None = None) -> int:
+    """`pai fetch <run>` - pull (or re-pull) the run's NVML files from gamma.
+
+    The normal path fetches automatically when a run ends; this is the retry
+    for runs that completed while gamma was unreachable.
+    """
+    from gpu_power_monitor.config import load_config
+    from gpu_power_monitor.manifest import load_manifest, refresh_file_inventory, update_manifest
+    from gpu_power_monitor.remote import NvmlLogger, remote_unready_reason
+
+    run_dir = _resolve_run(run)
+    if not run_dir.is_dir():
+        print(f"[ERROR] No such run: {run}")
+        return 1
+    config = load_config(config_path or _default_config())
+    reason = remote_unready_reason(config.remote)
+    if reason:
+        print(f"[ERROR] Cannot reach gamma: {reason}")
+        return 1
+    logger = NvmlLogger(config.remote, run_dir.name)
+    print(f"[INFO] Fetching {logger.remote_dir} from {config.remote.host} ...")
+    result = logger.stop_and_fetch(run_dir / "nvml")
+    update_manifest(run_dir, nvml=result)
+    if result.get("status") != "fetched":
+        print(f"[ERROR] Fetch failed: {result.get('error')}")
+        return 1
+    print(f"[INFO] Fetched: {', '.join(result['files'])}")
+    data = load_manifest(run_dir)
+    if data.get("status") == "completed":
+        refresh_file_inventory(run_dir)
+        print("[INFO] Manifest file inventory refreshed (NVML files are now checksummed).")
+    if data.get("archive_status") in ("archived_verified", "cleanup_eligible"):
+        print("[WARN] This run was already archived WITHOUT the NVML files - push again to "
+              f'complete the archive copy: pai archive push "{run_dir.name}"')
+    return 0
+
+
 def _relocate_run(run_dir: Path, *, test: bool) -> Path:
     """Move a run folder to match its kind (output/ vs output/test/).
 
@@ -308,6 +346,7 @@ def run_hardware(
     display: bool,
     name: str | None = None,
     test: bool = False,
+    gpus: str | None = None,
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
@@ -316,12 +355,19 @@ def run_hardware(
     import threading
 
     from gpu_power_monitor.acquisition import acquire, with_measurement_name
-    from gpu_power_monitor.config import load_config
+    from gpu_power_monitor.config import load_config, select_gpus
     from gpu_power_monitor.utils import runs_root, unique_run_dir
 
     config = with_measurement_name(
         load_config(config_path or _default_config()), name or auto_run_name(test=test)
     )
+    try:
+        config = select_gpus(config, gpus)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+    if len(config.channels.gpus) < 4:
+        print(f"[INFO] Measuring: {', '.join(config.channels.labels)}")
     if test:
         config = dataclasses.replace(config, test_run=True)
 
@@ -608,14 +654,16 @@ def interactive_menu() -> int:
     print("  4) Open dashboard - replay a past run    [demo]")
     print("  5) Archive a run (Globus -> cluster archive)")
     print("  6) Manage a test run (promote / delete)")
-    print("  7) Quit")
-    choice = input("Select [1-7]: ").strip()
+    print("  7) Fetch NVML files from gamma (retry for a past run)")
+    print("  8) Quit")
+    choice = input("Select [1-8]: ").strip()
     if choice in {"1", "2"}:
         test = input("Test run? Stays local, never archived [y/N]: ").strip().lower().startswith("y")
         auto = _TEST_NAME_PREFIX if test else _AUTO_NAME_PREFIX
         name = input(f"Measurement name (blank = auto '{auto} N'): ").strip() or None
+        gpus = input("GPUs to measure (e.g. 1 or GPU1,GPU3; blank = all): ").strip() or None
         simulate = input("Use simulated data (no NI hardware)? [y/N]: ").strip().lower().startswith("y")
-        return run_hardware(simulate=simulate, display=(choice == "2"), name=name, test=test)
+        return run_hardware(simulate=simulate, display=(choice == "2"), name=name, test=test, gpus=gpus)
     if choice == "3":
         latest = _latest_run()
         if latest is None:
@@ -633,6 +681,11 @@ def interactive_menu() -> int:
     if choice == "6":
         return _menu_test_runs()
     if choice == "7":
+        run = _choose_run("Past runs (newest first):", annotate=_archive_label)
+        if run is None:
+            return 1
+        return run_fetch(run)
+    if choice == "8":
         return 0
     print("[WARN] Unrecognized choice.")
     return 1
@@ -655,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--test",
         action="store_true",
         help="Test run: stays local, never archived; delete at will with `pai runs delete`.",
+    )
+    p_hw.add_argument(
+        "--gpus",
+        help="Measure only these GPUs: labels or 1-based indices, comma-separated "
+        '(e.g. "1", "GPU1,GPU3"). Default: all configured GPUs.',
     )
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
@@ -684,6 +742,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("action", choices=["list", "promote", "demote", "delete"])
     p_runs.add_argument("run", nargs="?", help="Run directory or name (not needed for list).")
 
+    p_fetch = sub.add_parser("fetch", help="Pull a run's NVML files from gamma (retry).")
+    p_fetch.add_argument("run", help="Run directory under output/.")
+    p_fetch.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
+
     return parser
 
 
@@ -703,6 +765,7 @@ def main(argv: list[str] | None = None) -> int:
             display=args.display,
             name=args.name,
             test=args.test,
+            gpus=args.gpus,
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,
@@ -728,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "runs":
         return run_runs(args.action, args.run)
+    if args.command == "fetch":
+        return run_fetch(args.run, config_path=Path(args.config) if args.config else None)
     parser.print_help()
     return 1
 

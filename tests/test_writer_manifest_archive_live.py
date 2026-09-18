@@ -22,26 +22,35 @@ from gpu_power_monitor.manifest import create_manifest, finalize_manifest, load_
 from gpu_power_monitor.processing import ProcessedBlock
 
 
+LABELS = ["GPU1", "GPU2"]
+
+
 def block(times):
     times = np.asarray(times, dtype=float)
+    ones = np.ones_like(times)
     return ProcessedBlock(
         time_s=times,
-        voltage_v=np.ones_like(times) * 12,
-        current1_a=np.ones_like(times),
-        current2_a=np.ones_like(times) * 2,
-        total_current_a=np.ones_like(times) * 3,
-        total_power_w=np.ones_like(times) * 36,
+        labels=LABELS,
+        voltage_v=[ones * 12, ones * 12],
+        current_a=[ones * 1, ones * 2],
+        power_w=[ones * 12, ones * 24],
+        total_power_w=ones * 36,
     )
 
 
 def test_csv_chunk_rotation(tmp_path):
-    writer = ChunkWriter(tmp_path, "test", 1.0, dt.datetime(2026, 1, 1), queue_blocks=4)
+    writer = ChunkWriter(tmp_path, "test", 1.0, dt.datetime(2026, 1, 1), labels=LABELS, queue_blocks=4)
     writer.write_block(block([0.0, 0.5, 1.0, 1.5]))
     paths = writer.finalize(2.0)
     assert len(paths) == 2
     with open(paths[0], newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
-    assert rows[0] == ["time_s", "voltage_v", "current1_a", "current2_a", "total_power_w"]
+    assert rows[0] == [
+        "time_s",
+        "gpu1_voltage_v", "gpu1_current_a", "gpu1_power_w",
+        "gpu2_voltage_v", "gpu2_current_a", "gpu2_power_w",
+        "total_power_w",
+    ]
     assert len(rows) == 3
     assert not list(tmp_path.glob("*PENDING*"))
 
@@ -49,7 +58,7 @@ def test_csv_chunk_rotation(tmp_path):
 def test_manifest_checksums_and_stats(tmp_path):
     config = AcquisitionConfig(measurement_name="test")
     create_manifest(tmp_path, config)
-    writer = ChunkWriter(tmp_path, "test", 10.0, dt.datetime(2026, 1, 1))
+    writer = ChunkWriter(tmp_path, "test", 10.0, dt.datetime(2026, 1, 1), labels=LABELS)
     writer.write_block(block([0.0, 1.0, 2.0]))
     writer.finalize(3.0)
     finalize_manifest(tmp_path, 3.0)
@@ -173,18 +182,19 @@ def test_demote_refused_once_archived(tmp_path):
 def test_web_latest_payload(tmp_path):
     from gpu_power_monitor.web.server import build_latest_payload
 
-    live = LiveBuffer(tmp_path, sample_rate_hz=10, window_sec=1, max_points=50)
+    live = LiveBuffer(tmp_path, sample_rate_hz=10, window_sec=1, labels=LABELS, max_points=50)
     live.append(block([0.0, 0.1, 0.2]), state="LIVE")
     payload = build_latest_payload(tmp_path, stale_after_sec=10)
     assert payload["state"] == "LIVE"
     assert len(payload["time_s"]) == 3
-    assert "current1_a" in payload and "current2_a" in payload
+    assert "gpu1_current_a" in payload and "gpu2_current_a" in payload
+    assert "total_power_w" in payload
     assert payload["run_peak_power_w"] == 36
     assert payload["run_avg_power_w"] == 36
 
 
 def test_live_buffer_freshness(tmp_path):
-    live = LiveBuffer(tmp_path, sample_rate_hz=10, window_sec=1, max_points=10)
+    live = LiveBuffer(tmp_path, sample_rate_hz=10, window_sec=1, labels=LABELS, max_points=10)
     live.append(block([0.0, 0.1]), state="LIVE")
     assert read_live_status(tmp_path, stale_after_sec=10).state == "LIVE"
     status_path = tmp_path / "latest_status.json"

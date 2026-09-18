@@ -91,6 +91,16 @@ def finalize_manifest(run_dir: Path, end_time_s: float) -> dict[str, Any]:
     return data
 
 
+def refresh_file_inventory(run_dir: Path) -> dict[str, Any]:
+    """Rebuild the checksummed file list (e.g. after a late NVML fetch added
+    files to an already-finalized run)."""
+    run_dir = Path(run_dir)
+    data = load_manifest(run_dir)
+    data["files"] = build_file_inventory(run_dir)
+    save_manifest(run_dir, data)
+    return data
+
+
 def build_file_inventory(run_dir: Path) -> list[dict[str, Any]]:
     run_dir = Path(run_dir)
     files = []

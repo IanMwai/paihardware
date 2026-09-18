@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Protocol, Sequence
 
 import numpy as np
 
-from .config import ChannelConfig
+from .config import DEFAULT_GPUS, ChannelConfig, GpuChannel
 
 
 class DaqSource(Protocol):
@@ -16,7 +16,9 @@ class DaqSource(Protocol):
 
     def available_samples(self) -> int: ...
 
-    def read(self, n_samples: int) -> tuple[list[float], list[float], list[float]]: ...
+    def read(self, n_samples: int) -> tuple[list[list[float]], list[list[float]]]:
+        """Per-GPU raw samples: (voltages, currents), each one list per GPU."""
+        ...
 
 
 def ensure_channel_list(raw):
@@ -53,17 +55,19 @@ class NIDaqSource:
     def start(self) -> None:
         task = self._nidaqmx.Task()
         terminal = self._terminal_config(self.channels.terminal)
-        for physical in (
-            self.channels.voltage_physical,
-            self.channels.current1_physical,
-            self.channels.current2_physical,
-        ):
-            task.ai_channels.add_ai_voltage_chan(
-                physical,
-                min_val=float(self.channels.min_v),
-                max_val=float(self.channels.max_v),
-                terminal_config=terminal,
-            )
+        # Interleaved V/I pairs per GPU: GPU1 V, GPU1 I, GPU2 V, GPU2 I, ...
+        # read() unpacks channels back out by this order.
+        for gpu in self.channels.gpus:
+            for physical in (
+                gpu.voltage_physical(self.channels.device),
+                gpu.current_physical(self.channels.device),
+            ):
+                task.ai_channels.add_ai_voltage_chan(
+                    physical,
+                    min_val=float(self.channels.min_v),
+                    max_val=float(self.channels.max_v),
+                    terminal_config=terminal,
+                )
         task.timing.cfg_samp_clk_timing(
             rate=self.sample_rate_hz,
             source="",
@@ -88,15 +92,19 @@ class NIDaqSource:
             return 0
         return int(self.task.in_stream.avail_samp_per_chan)
 
-    def read(self, n_samples: int) -> tuple[list[float], list[float], list[float]]:
+    def read(self, n_samples: int) -> tuple[list[list[float]], list[list[float]]]:
         if self.task is None:
             raise RuntimeError("DAQ task has not been started")
         raw = self.task.read(number_of_samples_per_channel=int(n_samples), timeout=0.0)
         channels = ensure_channel_list(raw)
-        if len(channels) < 3:
-            raise RuntimeError("Expected 3 channels from task.read()")
-        n = min(len(channels[0]), len(channels[1]), len(channels[2]))
-        return channels[0][:n], channels[1][:n], channels[2][:n]
+        expected = 2 * len(self.channels.gpus)
+        if len(channels) < expected:
+            raise RuntimeError(f"Expected {expected} channels from task.read(), got {len(channels)}")
+        n = min(len(ch) for ch in channels[:expected])
+        voltages = [channels[2 * g][:n] for g in range(len(self.channels.gpus))]
+        currents = [channels[2 * g + 1][:n] for g in range(len(self.channels.gpus))]
+        return voltages, currents
+
 
     def _terminal_config(self, mode: str):
         mode = mode.strip().upper()
@@ -111,10 +119,19 @@ class NIDaqSource:
 
 @dataclass
 class SimulatedDaqSource:
+    """Synthesizes plausible raw (pre-scaling) samples for each configured GPU.
+
+    Values are divided/signed so that after PowerProcessor's scaling each GPU
+    shows ~12 V and a distinct current waveform — including the sign flips on
+    GPU2-4, so simulation exercises the same math as hardware.
+    """
+
     sample_rate_hz: float
     chunk_size: int = 1000
+    gpus: Sequence[GpuChannel] = DEFAULT_GPUS
+    current_scale: float = 12.5
     _sample_index: int = 0
-    _running: bool = False
+    _running: bool = field(default=False, init=False)
 
     def start(self) -> None:
         self._running = True
@@ -125,14 +142,20 @@ class SimulatedDaqSource:
     def available_samples(self) -> int:
         return int(self.chunk_size) if self._running else 0
 
-    def read(self, n_samples: int) -> tuple[list[float], list[float], list[float]]:
+    def read(self, n_samples: int) -> tuple[list[list[float]], list[list[float]]]:
         if not self._running:
-            return [], [], []
+            return [], []
         n = int(n_samples)
         idx = np.arange(self._sample_index, self._sample_index + n, dtype=float)
         t = idx / float(self.sample_rate_hz)
-        raw_voltage = (12.1 + 0.08 * np.sin(2 * math.pi * 1.5 * t)) / 4.768
-        raw_current1 = (4.0 + 1.2 * np.sin(2 * math.pi * 4.0 * t)) / 12.5
-        raw_current2 = (3.0 + 0.9 * np.cos(2 * math.pi * 3.0 * t)) / 12.5
+        voltages = []
+        currents = []
+        for g, gpu in enumerate(self.gpus):
+            volts = 12.1 + 0.05 * np.sin(2 * math.pi * (1.0 + 0.5 * g) * t + g)
+            amps = (3.0 + 1.5 * g) + 1.2 * np.sin(2 * math.pi * (2.0 + g) * t + 2 * g)
+            voltages.append((volts / float(gpu.voltage_scale)).tolist())
+            currents.append(
+                (amps / (float(self.current_scale) * float(gpu.current_sign))).tolist()
+            )
         self._sample_index += n
-        return raw_voltage.tolist(), raw_current1.tolist(), raw_current2.tolist()
+        return voltages, currents

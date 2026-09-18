@@ -18,3 +18,5 @@ output/
 
 # Per-machine settings (endpoint UUIDs, archive paths) — see .env.example
 .env
+
+/presentation 
