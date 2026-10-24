@@ -2,6 +2,8 @@
 CSV columns, manifest inventory, and live snapshot — no NI hardware needed."""
 
 import csv
+
+from gpu_power_monitor.utils import chunk_paths, open_chunk
 import json
 
 import dataclasses
@@ -21,9 +23,10 @@ def test_simulated_run_writes_per_gpu_columns(tmp_path):
     config = _fast_config(tmp_path)
     run_dir = acquire(config, simulate=True, duration_sec=0.5, run_dir=tmp_path / "run")
 
-    csv_files = sorted(run_dir.glob("*.csv"))
+    csv_files = chunk_paths(run_dir)
     assert csv_files, "expected at least one CSV chunk"
-    with open(csv_files[0], newline="", encoding="utf-8") as handle:
+    assert all(path.name.endswith(".csv.gz") for path in csv_files)
+    with open_chunk(csv_files[0]) as handle:
         reader = csv.reader(handle)
         header = next(reader)
         first = next(reader)

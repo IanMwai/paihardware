@@ -20,16 +20,16 @@ The default causal power average uses ten samples, or 1 ms at 10 kHz. Saved powe
 ## What a run contains
 
 - `manifest.json`: configuration, acquisition status, sample statistics, and checksummed file inventory.
-- `nidaq_*.csv`: elapsed `time_s`, per-GPU voltage/current/power, and total power across the selected channels. Units are volts, amperes, and watts.
+- `nidaq_*.csv.gz` (or `.csv` when compression is disabled or falls back): elapsed `time_s`, per-GPU voltage/current/power, and total power across the selected channels. Units are volts, amperes, and watts.
 - `nvml/`: retrieved NVIDIA telemetry and server information when enabled.
 - `diagnostics/writer.jsonl`: queue depth, acquired/written sample counts, driver backlog, and writer timings.
 - `latest.npz` and `latest_status.json`: dashboard previews; these are not the complete recording.
 
 Summary energy uses joules. The manifest's sample count describes the recorded stream. A successful run requires acquired and written sample counts to agree. A queue or storage failure stops the recording and preserves an error instead of silently dropping blocks.
 
-## CSV and optional compression
+## CSV and gzip compression
 
-Plain CSV remains the default. Set `logging.compress: true` in a local configuration to compress closed chunks. Each logical chunk is published only after its export representation is settled. The hidden `.chunks` directory tracks publication and must stay with the run.
+Closed CSV chunks are compressed to `.csv.gz` by default. Compression is lossless and runs in the background. Python and pandas can read gzip files directly. Set `logging.compress: false` in a local configuration to keep plain CSV for debugging. Each logical chunk is published only after its export representation is settled. The hidden `.chunks` directory tracks publication and must stay with the run.
 
 A verified gzip can remain alongside a redundant CSV if Windows temporarily prevents deletion. Readers and inventories count matching representations once; conflicting contents raise an integrity error. If compression fails and the CSV is intact, recording keeps the CSV and records a warning. Do not delete one copy just because both exist without verifying them.
 

@@ -1,4 +1,6 @@
 import csv
+
+from gpu_power_monitor.utils import chunk_paths, open_chunk
 import dataclasses
 
 import pytest
@@ -49,9 +51,10 @@ def test_single_gpu_simulated_run_writes_only_its_columns(tmp_path):
     )
     config = select_gpus(config, "GPU1")
     run_dir = acquire(config, simulate=True, duration_sec=0.3, run_dir=tmp_path / "run")
-    csv_files = sorted(run_dir.glob("*.csv"))
+    csv_files = chunk_paths(run_dir)
     assert csv_files
-    with open(csv_files[0], newline="", encoding="utf-8") as handle:
+    assert all(path.name.endswith(".csv.gz") for path in csv_files)
+    with open_chunk(csv_files[0]) as handle:
         header = next(csv.reader(handle))
     assert header == ["time_s", "gpu1_voltage_v", "gpu1_current_a", "gpu1_power_w", "total_power_w"]
     assert "1GPU" in csv_files[0].name

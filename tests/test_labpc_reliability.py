@@ -32,12 +32,13 @@ def test_required_nvml_rejects_missing_and_unselected_gpu_samples(tmp_path):
 
 
 
-def test_lab_calibration_and_plain_csv_default(monkeypatch):
+def test_lab_calibration_and_gzip_default(monkeypatch):
     monkeypatch.delenv('PAI_OUTPUT_ROOT', raising=False)
     cfg=load_config(Path(__file__).resolve().parents[1]/"configs/default.yaml")
     assert [g.current_sign for g in cfg.channels.gpus]==[1,-1,-1,-1]
     assert [g.voltage_scale for g in cfg.channels.gpus]==[4.741144,4.611890,4.611890,4.606657]
-    assert cfg.logging.compress is False
+    assert cfg.logging.compress is True
+    assert AcquisitionConfig().logging.compress is True
     assert cfg.storage.output_root.is_absolute()
 
 

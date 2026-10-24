@@ -50,7 +50,7 @@ Start the workload separately on Gamma while recording. This lab-PC command does
 
 The GPU2/index 1 examples assume a verified mapping. Substitute the identifiers for your experiment.
 
-A normal run is saved under `output/`; test runs are under `output/test/`. `PAI_OUTPUT_ROOT` can select a different disk. The default recording is plain CSV, split into one-minute chunks. `manifest.json` records the configuration, status, statistics, and file checksums. Completion of acquisition and completion of archiving are separate steps.
+A normal run is saved under `output/`; test runs are under `output/test/`. `PAI_OUTPUT_ROOT` can select a different disk. Recordings are split into one-minute CSV chunks and compressed to `.csv.gz` in the background. Compression is lossless; Python and pandas can read these files directly. `manifest.json` records the configuration, status, statistics, and file checksums. Completion of acquisition and completion of archiving are separate steps.
 
 For long measurements, use the terminal without a live dashboard and leave it open until finalization finishes. The dashboard is optional; recorded files are the data to keep and analyze. On this Windows PC, `--display` opens a local browser. Replay plots are previews, not a replacement for the recorded samples.
 

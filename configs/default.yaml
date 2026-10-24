@@ -43,7 +43,7 @@ logging:
   queue_blocks: 200
   enqueue_timeout_sec: 5.0
   compression_queue_chunks: 2
-  compress: false  # Keep the lab PC's plain CSV default.
+  compress: true  # Compress closed chunks in the background.
 
 # The GPU workload machine ("gamma"). Credentials are machine-local: set
 # PAI_GAMMA_HOST / PAI_GAMMA_USER and PAI_GAMMA_PASSWORD (or

@@ -152,7 +152,7 @@ class LoggingConfig:
     queue_blocks: int = 200
     enqueue_timeout_sec: float = 5.0
     compression_queue_chunks: int = 2
-    compress: bool = False
+    compress: bool = True
 
 
 @dataclass(frozen=True)
