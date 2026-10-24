@@ -177,10 +177,22 @@ def moving_average_causal_ignore_nan(x: np.ndarray, n: int) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     if n <= 1 or x.size == 0:
         return x.copy()
-    out = np.empty_like(x, dtype=float)
-    for idx in range(x.size):
-        start = max(0, idx - n + 1)
-        window = x[start : idx + 1]
-        valid = window[~np.isnan(window)]
-        out[idx] = np.mean(valid) if valid.size else np.nan
-    return out
+    finite = np.isfinite(x)
+    sums = np.concatenate(([0.], np.cumsum(np.where(finite, x, 0.))))
+    counts = np.concatenate(([0], np.cumsum(finite, dtype=np.int64)))
+    end = np.arange(1, x.size + 1)
+    start = np.maximum(0, end - n)
+    denominator = counts[end] - counts[start]
+    result = np.divide(sums[end] - sums[start], denominator,
+                       out=np.full(x.shape, np.nan), where=denominator > 0)
+    # Keep legacy nanmean semantics for infinities without poisoning every
+    # later window through cumulative +/-inf sums.
+    if np.any(np.isinf(x)):
+        positive = np.concatenate(([0], np.cumsum(np.isposinf(x), dtype=np.int64)))
+        negative = np.concatenate(([0], np.cumsum(np.isneginf(x), dtype=np.int64)))
+        has_positive = (positive[end] - positive[start]) > 0
+        has_negative = (negative[end] - negative[start]) > 0
+        result[has_positive & ~has_negative] = np.inf
+        result[has_negative & ~has_positive] = -np.inf
+        result[has_positive & has_negative] = np.nan
+    return result

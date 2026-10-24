@@ -129,3 +129,43 @@ def atomic_replace_bytes(path: Path, data: bytes) -> None:
 
 def fmt_hhmmss_ms(value: dt.datetime) -> str:
     return value.strftime("%H%M%S") + f"{int(value.microsecond / 1000):03d}"
+
+CHUNK_SUFFIXES = (".csv", ".csv.gz")
+
+
+def chunk_paths(run_dir) -> list:
+    """The run's data chunks in time order, plain or gzipped (never PENDING)."""
+    from .chunks import canonical_chunks
+
+    return canonical_chunks(Path(run_dir))
+
+
+def open_chunk(path, mode: str = "rt"):
+    """Open a chunk for text reading whether or not it is gzipped."""
+    import gzip
+    from pathlib import Path as _P
+
+    path = _P(path)
+    if path.name.endswith(".gz"):
+        return gzip.open(path, mode, encoding="utf-8", newline="")
+    return open(path, mode.replace("t", ""), newline="", encoding="utf-8")
+
+
+STOP_FILE_NAME = "STOP"
+
+
+def stop_file(run_dir: Path) -> Path:
+    return Path(run_dir) / STOP_FILE_NAME
+
+
+def write_json(path: Path, data: dict) -> None:
+    import json
+    atomic_replace_text(path, json.dumps(data, sort_keys=True))
+
+
+def read_json(path: Path) -> dict:
+    import json
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}

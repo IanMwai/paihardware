@@ -32,13 +32,25 @@ class LiveBuffer:
         window_sec: float,
         labels: list[str],
         max_points: int = 2500,
+        publish_interval_sec: float = 0.5,
     ):
         self.run_dir = Path(run_dir)
         self.sample_rate_hz = float(sample_rate_hz)
         self.window_sec = float(window_sec)
         self.labels = list(labels)
         self.max_points = int(max_points)
-        points = max(1, int(self.sample_rate_hz * self.window_sec))
+        if self.max_points < 1:
+            raise ValueError("max_points must be positive")
+        self.publish_interval_sec = max(0.0, float(publish_interval_sec))
+        self._next_publish = 0.0
+        self._sample_cursor = 0
+        self._latest_values = None
+        # Decimate only the preview before buffering; full-rate data goes to
+        # ChunkWriter independently. Never rebuild millions of Python floats
+        # just to publish a 2,500-point dashboard snapshot.
+        window_samples = max(1, int(self.sample_rate_hz * self.window_sec))
+        self._stride = max(1, int(np.ceil(window_samples / self.max_points)))
+        points = max(1, int(np.ceil(window_samples / self._stride)))
         self.time_s = deque(maxlen=points)
         self.voltage_v = [deque(maxlen=points) for _ in self.labels]
         self.current_a = [deque(maxlen=points) for _ in self.labels]
@@ -53,14 +65,27 @@ class LiveBuffer:
         self._energy_j = 0.0
 
     def append(self, block: ProcessedBlock, state: str = "LIVE") -> None:
-        self.time_s.extend(block.time_s.tolist())
-        for g in range(len(self.labels)):
-            self.voltage_v[g].extend(block.voltage_v[g].tolist())
-            self.current_a[g].extend(block.current_a[g].tolist())
-            self.power_w[g].extend(block.power_w[g].tolist())
-        self.total_power.extend(block.total_power_w.tolist())
+        n = block.time_s.size
+        if not n:
+            return
+        offset = (-self._sample_cursor) % self._stride
+        selection = slice(offset, None, self._stride)
+        self._sample_cursor += n
+        self.time_s.extend(block.time_s[selection].tolist())
+        latest = {"time_s": float(block.time_s[-1]), "total_power_w": float(block.total_power_w[-1])}
+        for g, label in enumerate(self.labels):
+            self.voltage_v[g].extend(block.voltage_v[g][selection].tolist())
+            self.current_a[g].extend(block.current_a[g][selection].tolist())
+            self.power_w[g].extend(block.power_w[g][selection].tolist())
+            latest[f"{label.lower()}_voltage_v"] = float(block.voltage_v[g][-1])
+            latest[f"{label.lower()}_current_a"] = float(block.current_a[g][-1])
+            latest[f"{label.lower()}_power_w"] = float(block.power_w[g][-1])
+        self.total_power.extend(block.total_power_w[selection].tolist())
+        self._latest_values = latest
         self._accumulate_run_stats(block)
-        self.write_latest(state=state)
+        if time.monotonic() >= self._next_publish:
+            self.write_latest(state=state)
+            self._next_publish = time.monotonic() + self.publish_interval_sec
 
     def _accumulate_run_stats(self, block: ProcessedBlock) -> None:
         power = np.asarray(block.total_power_w, dtype=float)
@@ -102,6 +127,10 @@ class LiveBuffer:
             arrays[f"{gpu}_current_a"] = np.asarray(self.current_a[g], dtype=float)
             arrays[f"{gpu}_power_w"] = np.asarray(self.power_w[g], dtype=float)
         arrays["total_power_w"] = np.asarray(self.total_power, dtype=float)
+        if self._latest_values is not None and (
+            not arrays["time_s"].size or arrays["time_s"][-1] != self._latest_values["time_s"]
+        ):
+            arrays = {key: np.append(value, self._latest_values[key]) for key, value in arrays.items()}
         n = arrays["time_s"].size
         if n <= self.max_points:
             return arrays

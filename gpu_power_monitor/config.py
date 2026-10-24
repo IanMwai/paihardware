@@ -36,6 +36,7 @@ class GpuChannel:
     current: str
     voltage_scale: float
     current_sign: float = 1.0
+    nvml_id: str = ""  # Optional verified physical NVIDIA index or UUID.
 
     def voltage_physical(self, device: str) -> str:
         return f"{device}/{self.voltage}"
@@ -136,8 +137,10 @@ class RemoteConfig:
     key_path: str = ""
     # Where NVML logs for each run live on gamma: <remote_run_root>/<run_id>/
     remote_run_root: str = "pai_runs"
-    # nvidia-smi logging interval; NVML refreshes O(10 Hz), finer adds no info.
+    # Polling interval; hardware sensor update rates may differ.
     nvml_interval_ms: int = 100
+    gpu_ids: tuple[str, ...] = ()
+    required: bool = False
     connect_timeout_sec: float = 10.0
 
 
@@ -147,6 +150,9 @@ class LoggingConfig:
     file_prefix: str = "nidaq"
     format: str = "csv"
     queue_blocks: int = 200
+    enqueue_timeout_sec: float = 5.0
+    compression_queue_chunks: int = 2
+    compress: bool = False
 
 
 @dataclass(frozen=True)
@@ -177,7 +183,12 @@ def load_config(path: str | Path | None = None) -> AcquisitionConfig:
             raise FileNotFoundError(f"Config file not found: {path}")
         data = _load_mapping(path)
     _apply_env_overrides(data)
-    return config_from_mapping(data)
+    config = config_from_mapping(data)
+    root = config.storage.output_root
+    if not root.is_absolute():
+        config = dataclasses.replace(config, storage=dataclasses.replace(
+            config.storage, output_root=Path(__file__).resolve().parents[1] / root))
+    return config
 
 
 def load_dotenv(path: str | Path | None = None) -> None:
@@ -287,7 +298,7 @@ def select_gpus(config: AcquisitionConfig, selection: str | None) -> Acquisition
     order given, so CSV columns stay in a stable order.
     """
     if not selection or selection.strip().lower() == "all":
-        return config
+        return _map_channel_telemetry(config)
     gpus = config.channels.gpus
     by_label = {gpu.label.lower(): gpu for gpu in gpus}
     chosen: set[str] = set()
@@ -308,7 +319,11 @@ def select_gpus(config: AcquisitionConfig, selection: str | None) -> Acquisition
     if not subset:
         return config
     channels = dataclasses.replace(config.channels, gpus=subset)
-    return dataclasses.replace(config, channels=channels)
+    remote = config.remote
+    if len(remote.gpu_ids) == len(gpus):
+        ids = tuple(remote.gpu_ids[index] for index, gpu in enumerate(gpus) if gpu.label in chosen)
+        remote = dataclasses.replace(remote, gpu_ids=ids)
+    return _map_channel_telemetry(dataclasses.replace(config, channels=channels, remote=remote))
 
 
 def _as_bool(value: Any) -> bool:
@@ -348,3 +363,25 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError("Config file must contain a top-level mapping")
     return data
+
+
+def select_nvml_gpus(config: AcquisitionConfig, selection: str | None) -> AcquisitionConfig:
+    """Bind explicitly verified physical GPU IDs to the selected DAQ pairs."""
+    import re
+    if selection is None:
+        ids = tuple(config.remote.gpu_ids)
+        if not ids: return config
+    else:
+        ids = tuple(token.strip() for token in selection.split(","))
+    if len(ids) != len(config.channels.gpus) or len(set(ids)) != len(ids) or any(
+        not re.fullmatch(r"(?:[0-9]+|GPU-[A-Za-z0-9-]+)", token) for token in ids
+    ):
+        raise ValueError("--nvml-gpus needs one distinct physical index or UUID per selected DAQ GPU")
+    return dataclasses.replace(config, remote=dataclasses.replace(config.remote, gpu_ids=ids, required=True))
+
+
+def _map_channel_telemetry(config: AcquisitionConfig) -> AcquisitionConfig:
+    ids = tuple(gpu.nvml_id for gpu in config.channels.gpus)
+    if ids and all(ids):
+        return dataclasses.replace(config, remote=dataclasses.replace(config.remote, gpu_ids=ids, required=True))
+    return config

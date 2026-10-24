@@ -41,16 +41,19 @@ logging:
   file_prefix: "nidaq"
   format: "csv"
   queue_blocks: 200
+  enqueue_timeout_sec: 5.0
+  compression_queue_chunks: 2
+  compress: false  # Keep the lab PC's plain CSV default.
 
 # The GPU workload machine ("gamma"). Credentials are machine-local: set
 # PAI_GAMMA_HOST / PAI_GAMMA_USER and PAI_GAMMA_PASSWORD (or
 # PAI_GAMMA_KEY_PATH) in .env. Without credentials the NVML integration
-# disables itself; a run never depends on gamma being reachable.
+# is optional in legacy all-GPU mode; explicit GPU selections require it.
 remote:
   enabled: true
   # NVML logs for each run live at <remote_run_root>/<run_id>/ on gamma.
   remote_run_root: "pai_runs"
-  # nvidia-smi logging interval (ms). NVML refreshes O(10 Hz); finer adds no info.
+  # Polling interval (ms); the sensor update rate depends on the GPU.
   nvml_interval_ms: 100
   connect_timeout_sec: 10
 

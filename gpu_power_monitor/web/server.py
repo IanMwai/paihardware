@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 
 import numpy as np
 
+from gpu_power_monitor.utils import chunk_paths, open_chunk
+
 from ..live_buffer import read_live_status
 
 
@@ -22,10 +24,10 @@ def read_history_csv(run_dir: Path) -> dict[str, np.ndarray]:
     single-GPU runs (voltage_v / current1_a / current2_a) are mapped onto one
     synthetic "gpu1" so old runs replay in the multi-GPU dashboard.
     """
-    paths = sorted(Path(run_dir).glob("*.csv"))
+    paths = chunk_paths(run_dir)
     if not paths:
         return {"time_s": np.empty(0, dtype=float)}
-    with open(paths[0], newline="", encoding="utf-8") as handle:
+    with open_chunk(paths[0]) as handle:
         header = next(csv.reader(handle), [])
     legacy = "voltage_v" in header
     if legacy:
@@ -34,7 +36,7 @@ def read_history_csv(run_dir: Path) -> dict[str, np.ndarray]:
         columns = [name for name in header if name == "time_s" or name.endswith(("_voltage_v", "_current_a", "_power_w"))]
     values: dict[str, list[float]] = {name: [] for name in columns}
     for path in paths:
-        with open(path, newline="", encoding="utf-8") as handle:
+        with open_chunk(path) as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 try:

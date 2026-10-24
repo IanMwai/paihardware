@@ -2,17 +2,19 @@
 
 Runs an NVML logger (nvidia-smi) on gamma for the duration of a power run and
 pulls the results into the run folder, so the DAQ power data and the GPU-side
-telemetry archive together. Everything here is best-effort by design: a power
-run must never fail or block because gamma is unreachable.
+telemetry archive together. Explicit GPU selection requires valid telemetry;
+legacy all-GPU recordings can use best-effort telemetry.
 
 Auth: password or key from `.env` (see RemoteConfig). Key auth is preferred
-once gamma's ~/.ssh is fixed; password auth works today. Connections are
+when configured; password auth is also supported. Connections are
 opened per operation — runs last hours, holding a session open that long is
 less robust than reconnecting twice.
 """
 
 from __future__ import annotations
 
+import csv
+import datetime as dt
 import posixpath
 import shlex
 from pathlib import Path
@@ -85,7 +87,7 @@ _INFO_COMMANDS = (
 # One NVML sample per line; timestamp comes from gamma's clock (record both
 # clocks in the manifest so streams can be aligned in analysis).
 _NVML_QUERY = (
-    "timestamp,index,name,power.draw,utilization.gpu,utilization.memory,"
+    "timestamp,index,uuid,name,power.draw,utilization.gpu,utilization.memory,"
     "temperature.gpu,clocks.sm,memory.used"
 )
 
@@ -107,11 +109,18 @@ class NvmlLogger:
     def start(self) -> None:
         """Create the remote run dir, record GPU metadata, launch the logger."""
         interval = max(1, int(self.config.nvml_interval_ms))
-        info_block = " ; ".join(_INFO_COMMANDS)
+        info_commands = _INFO_COMMANDS
+        if self.config.gpu_ids:
+            ids = shlex.quote(",".join(self.config.gpu_ids))
+            info_commands = tuple(command + " -i " + ids if command.startswith("nvidia-smi") else command for command in info_commands)
+        info_block = " ; ".join(info_commands)
+        selection = ""
+        if self.config.gpu_ids:
+            selection = "-i " + shlex.quote(",".join(self.config.gpu_ids)) + " "
         command = (
             f"mkdir -p {self._quoted_dir} && "
             f"{{ {info_block} ; }} > {self._quoted_dir}/gamma_info.txt 2>&1 ; "
-            f"nohup nvidia-smi --query-gpu={_NVML_QUERY} --format=csv,nounits "
+            f"nohup nvidia-smi {selection}--query-gpu={_NVML_QUERY} --format=csv,nounits "
             f"-lms {interval} > {self._quoted_dir}/nvml.csv 2> {self._quoted_dir}/nvml.err "
             f"< /dev/null & echo $! > {self._quoted_dir}/nvml.pid ; cat {self._quoted_dir}/nvml.pid"
         )
@@ -123,6 +132,12 @@ class NvmlLogger:
                 raise RemoteUnavailable(
                     f"NVML logger did not start (exit {code}): {err.strip() or out.strip()}"
                 )
+            if self.config.required:
+                alive, detail, _ = run_command(client, f"sleep 0.2; kill -0 {int(pid)} 2>/dev/null || cat {self._quoted_dir}/nvml.err")
+                # kill's status must not be masked by a successful cat.
+                alive, _, _ = run_command(client, f"kill -0 {int(pid)} 2>/dev/null")
+                if alive != 0:
+                    raise RemoteUnavailable(f"Required NVML process exited: {detail}")
         finally:
             client.close()
 
@@ -137,6 +152,7 @@ class NvmlLogger:
             "host": self.config.host,
             "remote_dir": self.remote_dir,
             "interval_ms": int(self.config.nvml_interval_ms),
+            "gpu_ids": list(self.config.gpu_ids),
             "status": "missing",
         }
         try:
@@ -156,9 +172,13 @@ class NvmlLogger:
                 result["status"] = "fetched"
                 result["files"] = fetched
                 result["fetched_at"] = utc_now_iso()
+                if self.config.required:
+                    telemetry = validate_nvml(Path(dest_dir) / "nvml.csv", self.config.gpu_ids)
+                    result.update(telemetry)
             else:
                 result["error"] = f"no files found at {self.remote_dir} on {self.config.host}"
         except Exception as exc:
+            result["status"] = "missing"
             result["error"] = str(exc)
         finally:
             client.close()
@@ -182,3 +202,31 @@ class NvmlLogger:
             return fetched
         finally:
             sftp.close()
+
+
+def validate_nvml(path: Path, expected: tuple[str, ...]) -> dict:
+    """Require actual samples for every selected GPU, and no unselected samples."""
+    counts = {gpu: 0 for gpu in expected}
+    first = last = None
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, skipinitialspace=True)
+        for row in reader:
+            row = {k.strip(): str(v).strip() for k, v in row.items() if k}
+            matches = [gpu for gpu in expected if gpu == row.get("index") or gpu == row.get("uuid")]
+            if len(matches) != 1:
+                raise RemoteUnavailable("NVML sample does not match the selected GPU assignment")
+            try:
+                power = float(row.get("power.draw [W]", row.get("power.draw")))
+                import math
+                if not math.isfinite(power): raise ValueError("non-finite power")
+                stamp = dt.datetime.strptime(row["timestamp"], "%Y/%m/%d %H:%M:%S.%f")
+            except (KeyError, ValueError) as exc:
+                raise RemoteUnavailable(f"Invalid required NVML power sample: {exc}") from exc
+            counts[matches[0]] += 1
+            first = stamp if first is None else min(first, stamp)
+            last = stamp if last is None else max(last, stamp)
+    if not counts or any(n == 0 for n in counts.values()):
+        raise RemoteUnavailable("Missing required NVML samples")
+    return {"sample_counts": counts, "observed_span_s": (last - first).total_seconds(),
+            "first_timestamp": first.isoformat(), "last_timestamp": last.isoformat(),
+            "clock": "GPU host local clock; align separately with DAQ clock"}

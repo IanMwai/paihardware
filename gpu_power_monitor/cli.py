@@ -2,7 +2,7 @@
 
 Two layers over the same underlying workflows:
 
-* Direct subcommands for the **developer** persona (scriptable, no prompts)::
+* Direct subcommands for terminal use (scriptable, no prompts)::
 
       pai hardware [--simulate] [--test]  # start acquisition (headless by default)
       pai dashboard <run> [--replay]      # open a dashboard on a run
@@ -10,8 +10,7 @@ Two layers over the same underlying workflows:
       pai runs list|promote|demote|delete [run]  # test runs vs archive-bound runs
       pai fetch <run>                     # retry pulling NVML files from gamma
 
-* An interactive **menu** for the lab-demo persona, shown when `pai` is run with
-  no arguments. It favors fast uptime and quick live/replay viewing.
+* An interactive menu, shown when `pai` is run with no arguments.
 """
 
 from __future__ import annotations
@@ -209,7 +208,12 @@ def run_fetch(run: str | Path, *, config_path: Path | None = None) -> int:
     if reason:
         print(f"[ERROR] Cannot reach gamma: {reason}")
         return 1
-    logger = NvmlLogger(config.remote, run_dir.name)
+    import dataclasses
+    selection = load_manifest(run_dir).get("nvml_selection", {})
+    remote = config.remote
+    if selection.get("gpu_ids"):
+        remote = dataclasses.replace(remote, gpu_ids=tuple(selection["gpu_ids"]), required=bool(selection.get("required")))
+    logger = NvmlLogger(remote, run_dir.name)
     print(f"[INFO] Fetching {logger.remote_dir} from {config.remote.host} ...")
     result = logger.stop_and_fetch(run_dir / "nvml")
     update_manifest(run_dir, nvml=result)
@@ -347,6 +351,7 @@ def run_hardware(
     name: str | None = None,
     test: bool = False,
     gpus: str | None = None,
+    nvml_gpus: str | None = None,
     port: int = 8000,
     config_path: Path | None = None,
     duration_sec: float | None = None,
@@ -355,7 +360,7 @@ def run_hardware(
     import threading
 
     from gpu_power_monitor.acquisition import acquire, with_measurement_name
-    from gpu_power_monitor.config import load_config, select_gpus
+    from gpu_power_monitor.config import load_config, select_gpus, select_nvml_gpus
     from gpu_power_monitor.utils import runs_root, unique_run_dir
 
     config = with_measurement_name(
@@ -363,30 +368,40 @@ def run_hardware(
     )
     try:
         config = select_gpus(config, gpus)
+        config = select_nvml_gpus(config, nvml_gpus)
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         return 1
+    import math
+    if duration_sec is not None and (not math.isfinite(duration_sec) or duration_sec <= 0):
+        print("[ERROR] --duration-sec must be finite and positive")
+        return 2
     if len(config.channels.gpus) < 4:
         print(f"[INFO] Measuring: {', '.join(config.channels.labels)}")
     if test:
         config = dataclasses.replace(config, test_run=True)
 
     if not display:
-        # Headless (developer): acquisition in the foreground, Ctrl+C to stop.
-        run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec)
-        _auto_push(run_dir, config)
-        return 0
+        # Acquisition in the foreground; Ctrl+C requests a clean stop.
+        try:
+            run_dir = acquire(config, simulate=simulate, duration_sec=duration_sec)
+        except Exception as exc:
+            print(f"[ERROR] Acquisition stopped: {exc}")
+            return 1
+        return _finish_hardware_run(run_dir, config)
 
-    # Demo: acquisition in a background thread, dashboard in the foreground.
+    # With a dashboard, acquisition runs in a background thread.
     from gpu_power_monitor.web import serve
 
     run_dir = unique_run_dir(runs_root(config.storage.output_root, test=test), config.measurement_name)
     stop = threading.Event()
+    errors = []
 
     def _background_acquire() -> None:
         try:
             acquire(config, simulate=simulate, run_dir=run_dir, stop_event=stop, duration_sec=duration_sec)
-        except Exception as exc:  # surface, don't kill the dashboard
+        except Exception as exc:
+            errors.append(exc)
             print(f"[ERROR] Acquisition stopped: {exc}")
 
     thread = threading.Thread(target=_background_acquire, daemon=True)
@@ -403,7 +418,25 @@ def run_hardware(
         serve(run_dir, display=display_cfg, port=port, open_browser=True)
     finally:
         stop.set()
-        thread.join(timeout=15.0)
+        thread.join(timeout=120.0)
+    if thread.is_alive():
+        print(f"[ERROR] Acquisition shutdown is unconfirmed; preserve {run_dir} and inspect its status")
+        return 1
+    if errors:
+        return 1
+    return _finish_hardware_run(run_dir, config)
+
+
+def _finish_hardware_run(run_dir, config):
+    from gpu_power_monitor.manifest import load_manifest
+    try:
+        manifest = load_manifest(run_dir)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] Cannot verify completed acquisition: {exc}")
+        return 1
+    if manifest.get("status") != "completed":
+        print(f"[ERROR] Run did not complete: {manifest.get('error') or manifest.get('status')}")
+        return 1
     _auto_push(run_dir, config)
     return 0
 
@@ -648,10 +681,10 @@ def interactive_menu() -> int:
     print("PAI hardware - GPU power monitor")
     print("=================================")
     _refresh_pending_transfers()
-    print("  1) Start measurement (headless)        [developer]")
-    print("  2) Start measurement + live dashboard   [demo]")
-    print("  3) Open dashboard - latest run (live)    [demo]")
-    print("  4) Open dashboard - replay a past run    [demo]")
+    print("  1) Start a measurement")
+    print("  2) Start a measurement with the dashboard")
+    print("  3) View the latest run")
+    print("  4) Replay a saved run")
     print("  5) Archive a run (Globus -> cluster archive)")
     print("  6) Manage a test run (promote / delete)")
     print("  7) Fetch NVML files from gamma (retry for a past run)")
@@ -663,7 +696,10 @@ def interactive_menu() -> int:
         name = input(f"Measurement name (blank = auto '{auto} N'): ").strip() or None
         gpus = input("GPUs to measure (e.g. 1 or GPU1,GPU3; blank = all): ").strip() or None
         simulate = input("Use simulated data (no NI hardware)? [y/N]: ").strip().lower().startswith("y")
-        return run_hardware(simulate=simulate, display=(choice == "2"), name=name, test=test, gpus=gpus)
+        nvml_gpus = None
+        if gpus and gpus.strip().lower() != "all":
+            nvml_gpus = input("Matching NVIDIA GPU indices or UUIDs (verified wiring; blank for DAQ-only/unconfigured telemetry): ").strip() or None
+        return run_hardware(simulate=simulate, display=(choice == "2"), name=name, test=test, gpus=gpus, nvml_gpus=nvml_gpus)
     if choice == "3":
         latest = _latest_run()
         if latest is None:
@@ -714,6 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Measure only these GPUs: labels or 1-based indices, comma-separated "
         '(e.g. "1", "GPU1,GPU3"). Default: all configured GPUs.',
     )
+    p_hw.add_argument("--nvml-gpus", help="Verified NVIDIA indices or GPU UUIDs, one per selected DAQ pair in config order.")
     p_hw.add_argument("--port", type=int, default=8000, help="Dashboard port (with --display).")
     p_hw.add_argument("--config", help="Config YAML (default: configs/default.yaml).")
     p_hw.add_argument("--duration-sec", type=float, help="Optional finite duration for smoke tests.")
@@ -766,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
             name=args.name,
             test=args.test,
             gpus=args.gpus,
+            nvml_gpus=args.nvml_gpus,
             port=args.port,
             config_path=Path(args.config) if args.config else None,
             duration_sec=args.duration_sec,

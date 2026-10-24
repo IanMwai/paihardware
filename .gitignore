@@ -20,3 +20,6 @@ output/
 .env
 
 /presentation 
+
+# Verified local wiring / telemetry mappings
+configs/*.local.yaml
